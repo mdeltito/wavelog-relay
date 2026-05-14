@@ -172,8 +172,8 @@ async fn full_round_trip_outbound_and_inbound() {
         "missing `F 14074000` in {recorded:?}",
     );
     assert!(
-        recorded.contains(&"M USB 0".to_owned()),
-        "missing `M USB 0` in {recorded:?}",
+        recorded.contains(&"M USB -1".to_owned()),
+        "missing `M USB -1` in {recorded:?}",
     );
 
     // --- ws bandmap: connect a client and observe a radio_status frame ---

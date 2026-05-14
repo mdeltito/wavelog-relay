@@ -441,7 +441,12 @@ async fn exec_set_mode(
     mode: HamlibMode,
 ) -> io::Result<Result<(), RigError>> {
     let mode_str = mode.as_str();
-    conn.send(&format!("M {mode_str} 0")).await?;
+    // Passband -1 == RIG_PASSBAND_NOCHANGE in hamlib: change the mode
+    // but leave the rig's current DSP filter width alone. Sending `0`
+    // (RIG_PASSBAND_NORMAL) makes the backend apply the rig's default
+    // passband for the new mode, which clobbers a user's tuned filter
+    // every click-to-tune (e.g. FT-710 snapping back to 2400 Hz USB).
+    conn.send(&format!("M {mode_str} -1")).await?;
     let line = conn.read_line().await?;
     Ok(parse_set_response(line))
 }
@@ -584,11 +589,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn set_mode_sends_uppercase_hamlib_with_zero_passband() {
+    async fn set_mode_sends_uppercase_hamlib_with_nochange_passband() {
         let addr = spawn_mock(|mut conn| async move {
-            conn.expect("M USB 0").await;
+            conn.expect("M USB -1").await;
             conn.reply("RPRT 0").await;
-            conn.expect("M PKTUSB 0").await;
+            conn.expect("M PKTUSB -1").await;
             conn.reply("RPRT 0").await;
         })
         .await;

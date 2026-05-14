@@ -224,7 +224,7 @@ mod tests {
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
 
-        assert_eq!(mock.commands(), vec!["F 14074000", "M USB 0"]);
+        assert_eq!(mock.commands(), vec!["F 14074000", "M USB -1"]);
     }
 
     #[tokio::test]
@@ -312,7 +312,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
-        assert_eq!(mock.commands(), vec!["F 14074000", "M USB 0"]);
+        assert_eq!(mock.commands(), vec!["F 14074000", "M USB -1"]);
     }
 
     #[tokio::test]
@@ -330,7 +330,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
-        assert_eq!(mock.commands(), vec!["F 3573000", "M PKTLSB 0"]);
+        assert_eq!(mock.commands(), vec!["F 3573000", "M PKTLSB -1"]);
     }
 
     #[tokio::test]
