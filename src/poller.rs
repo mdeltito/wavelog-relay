@@ -15,12 +15,21 @@ use tokio::time::{MissedTickBehavior, interval};
 
 use crate::rigctld::RigHandle;
 use crate::wavelog::WavelogClient;
+use crate::ws::WsBandmapHandle;
 
 /// Run the poll → push loop until `shutdown` resolves to `true` or the
 /// watch sender is dropped. Per-tick errors are logged and skipped.
+///
+/// `ws_bandmap` is broadcast-to on every successful rig poll, regardless
+/// of the wavelog client's dedupe state — WS subscribers want live VFO
+/// updates; the dedupe exists to spare Wavelog DB writes, not WS
+/// recipients. The handle is always present (constructed even when
+/// `--no-ws` is set) and broadcasts to zero subscribers are no-ops, so
+/// the hot path stays branchless on the disable flag.
 pub async fn run(
     rig: RigHandle,
     mut client: WavelogClient,
+    ws_bandmap: WsBandmapHandle,
     tick_interval: Duration,
     mut shutdown: watch::Receiver<bool>,
 ) {
@@ -36,7 +45,7 @@ pub async fn run(
     tracing::info!(?tick_interval, "poller started");
     loop {
         tokio::select! {
-            _ = ticker.tick() => tick(&rig, &mut client).await,
+            _ = ticker.tick() => tick(&rig, &mut client, &ws_bandmap).await,
             result = shutdown.changed() => {
                 // Sender dropped, or value changed: either way, only
                 // exit when the value is now `true`.
@@ -50,7 +59,7 @@ pub async fn run(
     }
 }
 
-async fn tick(rig: &RigHandle, client: &mut WavelogClient) {
+async fn tick(rig: &RigHandle, client: &mut WavelogClient, ws_bandmap: &WsBandmapHandle) {
     let state = match rig.poll().await {
         Ok(s) => s,
         Err(e) => {
@@ -58,6 +67,10 @@ async fn tick(rig: &RigHandle, client: &mut WavelogClient) {
             return;
         },
     };
+    // Broadcast before the wavelog POST — the POST awaits a network
+    // round-trip, but WS subscribers should see fresh state on every
+    // tick regardless of whether wavelog is reachable.
+    ws_bandmap.broadcast(&state);
     if let Err(e) = client.push(&state).await {
         tracing::warn!(error = %e, "wavelog push failed");
     }
@@ -130,12 +143,17 @@ mod tests {
         WavelogClient::new("http://127.0.0.1:1", "k", "r", 100.0).unwrap()
     }
 
+    fn dummy_ws_handle() -> WsBandmapHandle {
+        WsBandmapHandle::new("R".into(), 100.0)
+    }
+
     #[tokio::test]
     async fn shutdown_signal_set_to_true_stops_loop_promptly() {
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let poller = tokio::spawn(run(
             dummy_rig_handle(),
             dummy_wavelog_client(),
+            dummy_ws_handle(),
             Duration::from_secs(60),
             shutdown_rx,
         ));
@@ -154,6 +172,7 @@ mod tests {
         let poller = tokio::spawn(run(
             dummy_rig_handle(),
             dummy_wavelog_client(),
+            dummy_ws_handle(),
             Duration::from_secs(60),
             shutdown_rx,
         ));
@@ -180,7 +199,13 @@ mod tests {
         let client = WavelogClient::new(&server.uri(), "test-key", "FT-710", 100.0).unwrap();
 
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
-        let poller = tokio::spawn(run(rig, client, Duration::from_millis(50), shutdown_rx));
+        let poller = tokio::spawn(run(
+            rig,
+            client,
+            dummy_ws_handle(),
+            Duration::from_millis(50),
+            shutdown_rx,
+        ));
 
         // Real-time wait: ~4 ticks, but dedupe collapses them to 1 POST.
         tokio::time::sleep(Duration::from_millis(250)).await;
@@ -211,6 +236,7 @@ mod tests {
         let poller = tokio::spawn(run(
             dummy_rig_handle(),
             dummy_wavelog_client(),
+            dummy_ws_handle(),
             Duration::from_millis(20),
             shutdown_rx,
         ));

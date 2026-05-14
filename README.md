@@ -2,14 +2,15 @@
 
 Rust bridge between rigctld and Wavelog. One static binary, both directions:
 
-- **Outbound**: polls rigctld at 1 Hz and pushes rig state (frequency, mode, power) to Wavelog's `/api/radio`.
+- **Outbound (HTTP)**: polls rigctld at 1 Hz and pushes rig state (frequency, mode, power) to Wavelog's `/api/radio`.
+- **Outbound (WebSocket bandmap)**: serves `ws://127.0.0.1:54322` and broadcasts `radio_status` frames to Wavelog's bandmap client every tick, so the rig card and bandmap update live instead of on the 3 s AJAX poll.
 - **Inbound**: listens on `127.0.0.1:54321` for Wavelog's click-to-tune callback and dispatches `F`/`M` commands to rigctld.
 
 No GUI. Targets Linux and macOS. MIT.
 
 ## v1 scope
 
-Single rig, hamlib/rigctld only, single VFO. Multi-radio profiles, flrig XML-RPC, split-mode push, and the WebSocket bandmap (ports 54322/54323) are deferred.
+Single rig, hamlib/rigctld only, single VFO. Multi-radio profiles, flrig XML-RPC, split-mode push, native WSS (port 54323), and forwarding the frontend's inbound bandmap messages (`qso_logged` → UDP, `satellite_position` / `lookup_result` → rotctld) are deferred.
 
 ## Build
 
@@ -45,7 +46,9 @@ Every flag also reads `WAVELOG_BRIDGE_<UPPERCASE>` from the environment:
 | `--radio <NAME>` | _(required)_ | Identifier sent in the JSON push; must match the radio you configured in Wavelog |
 | `--key-file <PATH>` | _(see Secrets)_ | Path to file containing the API key |
 | `--power-max <W>` | `100` | Rig's max RF power, used to scale rigctld's `0.0..=1.0` RFPOWER reading |
-| `--listen <ADDR>` | `127.0.0.1:54321` | Listener bind |
+| `--listen <ADDR>` | `127.0.0.1:54321` | Click-to-tune listener bind |
+| `--ws-listen <ADDR>` | `127.0.0.1:54322` | WebSocket bandmap bind. Wavelog's frontend hardcodes this port — only change it if you're fronting the bridge with a reverse proxy |
+| `--no-ws` | _(off)_ | Disable the WebSocket bandmap server. Frontend falls back to its 3 s AJAX poll |
 | `--interval <DUR>` | `1s` | Humantime: `1s`, `500ms`, etc. |
 | `--rig-timeout <DUR>` | `3s` | Per-command read timeout against rigctld. On expiry the connection is dropped and the actor reconnects via backoff |
 | `--config <PATH>` | _(auto)_ | Optional TOML; auto-discovered at `$XDG_CONFIG_HOME/wavelog-bridge/config.toml` |
@@ -73,6 +76,8 @@ wavelog_url = "https://wavelog.example.com/index.php"
 radio = "FT-710"
 power_max = 100.0
 listen = "127.0.0.1:54321"
+ws_listen = "127.0.0.1:54322"
+no_ws = false
 interval = "1s"
 rig_timeout = "3s"
 log_level = "info"
@@ -143,9 +148,17 @@ journalctl -u wavelog-bridge -f
 
 On `systemctl suspend` / wake, both rigctld and wavelog-bridge recover automatically — the actor's capped exponential backoff (`500 ms → 1 s → 2 s → 5 s → 10 s`) handles the rigctld side, and reqwest retries handle transient Wavelog failures.
 
+## WebSocket bandmap
+
+Wavelog's frontend (`assets/js/cat.js`) opens a WebSocket to the local machine for live `radio_status` updates: first `wss://127.0.0.1:54323`, then falling back to `ws://127.0.0.1:54322`. wavelog-bridge serves the **WS port only** (54322). The frontend's WSS attempt fails fast and the fallback connects within a second, so you'll see one extra connection attempt in devtools and nothing else.
+
+Native WSS (54323) is deferred. If you need it today, terminate TLS in a reverse proxy and forward to `ws://127.0.0.1:54322`, or run with `--no-ws` and let the frontend fall back to its 3 s AJAX poll.
+
+The frontend will also send messages back over the socket (`qso_logged`, `satellite_position`, `lookup_result`) — wavelog-bridge accepts and discards these at debug log level. Forwarding to UDP (N1MM/JTDX) or rotctld is a future iteration with its own configuration.
+
 ## Browsers (Safari note)
 
-Click-to-tune issues `fetch('http://127.0.0.1:54321/<hz>/<mode>')` from an HTTPS Wavelog page — mixed content in the strict sense. Chromium and Firefox treat `127.0.0.1` as a potentially-trustworthy origin per the [Secure Contexts](https://w3c.github.io/webappsec-secure-contexts/) spec and allow it. Safari is stricter and may silently block these requests. If you're on Safari and click-to-tune doesn't work, switch to Chromium/Firefox or put a TLS terminator in front of wavelog-bridge.
+Click-to-tune issues `fetch('http://127.0.0.1:54321/<hz>/<mode>')` from an HTTPS Wavelog page, and the bandmap client opens `ws://127.0.0.1:54322` — both are mixed content in the strict sense. Chromium and Firefox treat `127.0.0.1` as a potentially-trustworthy origin per the [Secure Contexts](https://w3c.github.io/webappsec-secure-contexts/) spec and allow both. Safari is stricter and may silently block them. If you're on Safari and either feature doesn't work, switch to Chromium/Firefox or put a TLS terminator in front of wavelog-bridge.
 
 ## Verifying
 
@@ -169,6 +182,15 @@ curl -i http://127.0.0.1:54321/14074000/usb
 ```
 
 No `Access-Control-Allow-Origin` header on this — that's expected for a curl request without an `Origin` header. The rig should still retune.
+
+Manual WS bandmap smoke (replace `https://wavelog.example.com` with your configured origin — wavelog-bridge rejects mismatched `Origin` headers with `403`):
+
+```sh
+websocat ws://127.0.0.1:54322 -H 'Origin: https://wavelog.example.com'
+# {"type":"welcome"}
+# {"type":"radio_status","radio":"FT-710","frequency":14074000,...}
+# (one frame per second; ^C to exit)
+```
 
 ## License
 

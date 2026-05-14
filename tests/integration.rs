@@ -16,12 +16,17 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use axum::http::HeaderValue;
+use futures_util::StreamExt;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufStream};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::watch;
+use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+use tokio_tungstenite::tungstenite::http::HeaderValue as TungHeaderValue;
+use tokio_tungstenite::tungstenite::protocol::Message as TungMessage;
 use wavelog_bridge::modes::ModeOverrides;
 use wavelog_bridge::wavelog::WavelogClient;
-use wavelog_bridge::{listener, poller, rigctld};
+use wavelog_bridge::ws::WsBandmapHandle;
+use wavelog_bridge::{listener, poller, rigctld, ws};
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -101,12 +106,18 @@ async fn full_round_trip_outbound_and_inbound() {
     let tcp_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let listener_addr = tcp_listener.local_addr().unwrap();
 
+    // --- ws bandmap (real bind) ---
+    let ws_tcp_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let ws_addr = ws_tcp_listener.local_addr().unwrap();
+    let ws_handle = WsBandmapHandle::new("FT-710".into(), 100.0);
+
     // --- shutdown channel ---
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
     let poller_task = tokio::spawn(poller::run(
         rig_handle.clone(),
         client,
+        ws_handle.clone(),
         Duration::from_millis(50),
         shutdown_rx.clone(),
     ));
@@ -119,7 +130,15 @@ async fn full_round_trip_outbound_and_inbound() {
         shutdown_rx.clone(),
     ));
 
+    let ws_task = tokio::spawn(ws::serve(
+        ws_tcp_listener,
+        ws_handle.clone(),
+        HeaderValue::from_static("https://wavelog.test"),
+        shutdown_rx.clone(),
+    ));
+
     drop(rig_handle);
+    drop(ws_handle);
     drop(shutdown_rx);
 
     // Give the poller a couple of tick windows to push at least once.
@@ -157,9 +176,54 @@ async fn full_round_trip_outbound_and_inbound() {
         "missing `M USB 0` in {recorded:?}",
     );
 
+    // --- ws bandmap: connect a client and observe a radio_status frame ---
+    let ws_url = format!("ws://{ws_addr}/");
+    let mut req = ws_url.into_client_request().unwrap();
+    req.headers_mut().insert(
+        "Origin",
+        TungHeaderValue::from_static("https://wavelog.test"),
+    );
+    let (mut socket, _resp) = tokio::time::timeout(
+        Duration::from_secs(5),
+        tokio_tungstenite::connect_async(req),
+    )
+    .await
+    .expect("ws connect timed out")
+    .expect("ws connect failed");
+
+    // First frame is the welcome; subsequent frames are radio_status.
+    // Loop until we see a radio_status or hit the timeout.
+    let radio_status_body = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let msg = socket
+                .next()
+                .await
+                .expect("ws stream closed")
+                .expect("ws error");
+            match msg {
+                TungMessage::Text(s) => {
+                    let parsed: serde_json::Value = serde_json::from_str(s.as_ref()).unwrap();
+                    if parsed["type"] == "radio_status" {
+                        break parsed;
+                    }
+                },
+                _ => continue,
+            }
+        }
+    })
+    .await
+    .expect("never received a radio_status frame");
+
+    assert_eq!(radio_status_body["radio"], "FT-710");
+    assert_eq!(radio_status_body["frequency"], 14_000_000);
+    assert_eq!(radio_status_body["mode"], "USB");
+    assert!((radio_status_body["power"].as_f64().unwrap() - 10.0).abs() < 1e-3);
+    assert!(radio_status_body["timestamp"].as_str().is_some());
+
     // --- shutdown ---
     let _ = shutdown_tx.send(true);
     let _ = tokio::time::timeout(Duration::from_secs(2), poller_task).await;
     let _ = tokio::time::timeout(Duration::from_secs(2), listener_task).await;
+    let _ = tokio::time::timeout(Duration::from_secs(2), ws_task).await;
     let _ = tokio::time::timeout(Duration::from_secs(2), rig_join).await;
 }

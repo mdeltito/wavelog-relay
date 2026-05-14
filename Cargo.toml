@@ -11,7 +11,7 @@ str_to_string = "deny"
 [dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "net", "time", "sync", "macros", "signal"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
-axum = { version = "0.7", default-features = false, features = ["tokio", "http1"] }
+axum = { version = "0.7", default-features = false, features = ["tokio", "http1", "ws"] }
 tower-http = { version = "0.6", default-features = false, features = ["cors"] }
 clap = { version = "4", features = ["derive", "env"] }
 serde = { version = "1", features = ["derive"] }
@@ -29,6 +29,8 @@ tokio = { version = "1", features = ["test-util"] }
 wiremock = "0.6"
 tower = { version = "0.5", features = ["util"] }
 tempfile = "3"
+tokio-tungstenite = "0.24"
+futures-util = { version = "0.3", default-features = false, features = ["sink"] }
 
 [profile.release]
 lto = "thin"

@@ -25,6 +25,7 @@ use crate::rigctld::Endpoint;
 
 const DEFAULT_RIGCTLD_ADDR: &str = "127.0.0.1:4532";
 const DEFAULT_LISTEN_ADDR: &str = "127.0.0.1:54321";
+const DEFAULT_WS_LISTEN_ADDR: &str = "127.0.0.1:54322";
 const DEFAULT_POWER_MAX_WATTS: f32 = 100.0;
 const DEFAULT_POLL_INTERVAL: Duration = Duration::from_secs(1);
 const DEFAULT_RIG_TIMEOUT: Duration = Duration::from_secs(3);
@@ -63,6 +64,20 @@ pub struct Cli {
     #[arg(long, env = "WAVELOG_BRIDGE_LISTEN")]
     pub listen: Option<SocketAddr>,
 
+    /// WebSocket bandmap bind address. The Wavelog frontend
+    /// (`assets/js/cat.js`) hardcodes a fallback to `ws://127.0.0.1:54322`,
+    /// so changing this is only useful for local testing or to avoid
+    /// a port conflict before fronting the bridge with a reverse proxy.
+    /// Default 127.0.0.1:54322.
+    #[arg(long, env = "WAVELOG_BRIDGE_WS_LISTEN")]
+    pub ws_listen: Option<SocketAddr>,
+
+    /// Disable the WebSocket bandmap server entirely (no bind on
+    /// `--ws-listen`). The Wavelog frontend will fall back to its 3 s
+    /// AJAX poll for rig-card updates.
+    #[arg(long, env = "WAVELOG_BRIDGE_NO_WS")]
+    pub no_ws: bool,
+
     /// Poll interval (e.g. 1s, 500ms). Default 1s.
     #[arg(long, env = "WAVELOG_BRIDGE_INTERVAL", value_parser = parse_duration)]
     pub interval: Option<Duration>,
@@ -97,6 +112,8 @@ struct TomlConfig {
     radio: Option<String>,
     power_max: Option<f32>,
     listen: Option<SocketAddr>,
+    ws_listen: Option<SocketAddr>,
+    no_ws: Option<bool>,
     #[serde(default, with = "humantime_serde::option")]
     interval: Option<Duration>,
     #[serde(default, with = "humantime_serde::option")]
@@ -117,6 +134,8 @@ pub struct Config {
     pub key: Box<str>,
     pub power_max_watts: f32,
     pub listen_addr: SocketAddr,
+    pub ws_listen_addr: SocketAddr,
+    pub no_ws: bool,
     pub poll_interval: Duration,
     pub log_level: Box<str>,
     pub mode_overrides: ModeOverrides,
@@ -220,6 +239,21 @@ impl Config {
                 .expect("hardcoded default valid")
         });
 
+        let ws_listen_addr = cli.ws_listen.or(toml.ws_listen).unwrap_or_else(|| {
+            DEFAULT_WS_LISTEN_ADDR
+                .parse()
+                .expect("hardcoded default valid")
+        });
+
+        // `--no-ws` is a CLI bool: presence on the command line is
+        // enough to opt out. Fall through to TOML only when the flag
+        // wasn't passed.
+        let no_ws = if cli.no_ws {
+            true
+        } else {
+            toml.no_ws.unwrap_or(false)
+        };
+
         let poll_interval = cli
             .interval
             .or(toml.interval)
@@ -250,6 +284,8 @@ impl Config {
             key: key.into(),
             power_max_watts,
             listen_addr,
+            ws_listen_addr,
+            no_ws,
             poll_interval,
             log_level: log_level.into(),
             mode_overrides: toml.mode_overrides,
@@ -351,6 +387,8 @@ mod tests {
             key_file: None,
             power_max: Some(50.0),
             listen: Some("0.0.0.0:54321".parse().unwrap()),
+            ws_listen: Some("0.0.0.0:54322".parse().unwrap()),
+            no_ws: false,
             interval: Some(Duration::from_millis(500)),
             rig_timeout: Some(Duration::from_secs(5)),
             config: None,
@@ -374,6 +412,8 @@ mod tests {
             radio = "IC-7300"
             power_max = 50.0
             listen = "127.0.0.1:54321"
+            ws_listen = "127.0.0.1:54322"
+            no_ws = true
             interval = "500ms"
             log_level = "debug"
 
@@ -389,6 +429,11 @@ mod tests {
         assert_eq!(parsed.wavelog_url.as_deref(), Some("https://wavelog.test/"));
         assert_eq!(parsed.radio.as_deref(), Some("IC-7300"));
         assert_eq!(parsed.power_max, Some(50.0));
+        assert_eq!(
+            parsed.ws_listen,
+            Some("127.0.0.1:54322".parse::<SocketAddr>().unwrap())
+        );
+        assert_eq!(parsed.no_ws, Some(true));
         assert_eq!(parsed.interval, Some(Duration::from_millis(500)));
         assert_eq!(parsed.log_level.as_deref(), Some("debug"));
         assert_eq!(parsed.mode_overrides.pkt, HamlibMode::PktLsb);
@@ -424,6 +469,8 @@ mod tests {
             radio: Some("IGNORED".to_owned()),
             power_max: Some(1.0),
             listen: Some("127.0.0.1:1".parse().unwrap()),
+            ws_listen: Some("127.0.0.1:2".parse().unwrap()),
+            no_ws: Some(true),
             interval: Some(Duration::from_secs(60)),
             rig_timeout: Some(Duration::from_secs(99)),
             log_level: Some("trace".to_owned()),
@@ -438,6 +485,13 @@ mod tests {
             cfg.listen_addr,
             "0.0.0.0:54321".parse::<SocketAddr>().unwrap()
         );
+        assert_eq!(
+            cfg.ws_listen_addr,
+            "0.0.0.0:54322".parse::<SocketAddr>().unwrap()
+        );
+        // TOML asked to disable; CLI didn't pass --no-ws → CLI wins
+        // only when it was actually set, so TOML's `true` stands.
+        assert!(cfg.no_ws);
         assert_eq!(cfg.poll_interval, Duration::from_millis(500));
         assert_eq!(cfg.rig_timeout, Duration::from_secs(5));
         assert_eq!(&*cfg.log_level, "debug");
@@ -451,6 +505,8 @@ mod tests {
             radio: Some("IC-7300".to_owned()),
             power_max: Some(75.0),
             listen: Some("127.0.0.1:11111".parse().unwrap()),
+            ws_listen: Some("127.0.0.1:11122".parse().unwrap()),
+            no_ws: None,
             interval: Some(Duration::from_secs(2)),
             rig_timeout: Some(Duration::from_secs(7)),
             log_level: Some("warn".to_owned()),
@@ -461,6 +517,11 @@ mod tests {
         assert_eq!(&*cfg.wavelog_url, "https://wavelog.test/");
         assert_eq!(&*cfg.radio, "IC-7300");
         assert_eq!(cfg.power_max_watts, 75.0);
+        assert_eq!(
+            cfg.ws_listen_addr,
+            "127.0.0.1:11122".parse::<SocketAddr>().unwrap()
+        );
+        assert!(!cfg.no_ws);
         assert_eq!(cfg.poll_interval, Duration::from_secs(2));
         assert_eq!(cfg.rig_timeout, Duration::from_secs(7));
         assert_eq!(&*cfg.log_level, "warn");
@@ -482,10 +543,31 @@ mod tests {
             cfg.listen_addr,
             DEFAULT_LISTEN_ADDR.parse::<SocketAddr>().unwrap()
         );
+        assert_eq!(
+            cfg.ws_listen_addr,
+            DEFAULT_WS_LISTEN_ADDR.parse::<SocketAddr>().unwrap()
+        );
+        assert!(!cfg.no_ws);
         assert_eq!(cfg.power_max_watts, DEFAULT_POWER_MAX_WATTS);
         assert_eq!(cfg.poll_interval, DEFAULT_POLL_INTERVAL);
         assert_eq!(cfg.rig_timeout, DEFAULT_RIG_TIMEOUT);
         assert_eq!(&*cfg.log_level, DEFAULT_LOG_LEVEL);
+    }
+
+    #[test]
+    fn cli_no_ws_overrides_toml_false() {
+        let cli = Cli {
+            wavelog_url: Some("https://wavelog.test/".to_owned()),
+            radio: Some("R".to_owned()),
+            no_ws: true,
+            ..Cli::default()
+        };
+        let toml = TomlConfig {
+            no_ws: Some(false),
+            ..TomlConfig::default()
+        };
+        let cfg = Config::merge(cli, toml, "k".to_owned()).unwrap();
+        assert!(cfg.no_ws, "CLI --no-ws must override TOML no_ws = false");
     }
 
     #[test]
