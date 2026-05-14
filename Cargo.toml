@@ -10,6 +10,7 @@ str_to_string = "deny"
 
 [dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "net", "time", "sync", "macros", "signal"] }
+socket2 = { version = "0.5", features = ["all"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 axum = { version = "0.7", default-features = false, features = ["tokio", "http1", "ws"] }
 tower-http = { version = "0.6", default-features = false, features = ["cors"] }

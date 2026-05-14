@@ -115,7 +115,7 @@ async fn run_daemon(cli: Cli) -> anyhow::Result<()> {
 
     let wsjtx_socket = if config.wsjtx {
         Some(
-            tokio::net::UdpSocket::bind(config.wsjtx_listen_addr)
+            wsjtx::bind(config.wsjtx_listen_addr)
                 .await
                 .with_context(|| {
                     format!(

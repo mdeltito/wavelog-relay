@@ -191,10 +191,33 @@ wavelog-bridge stations
 
 The `stations` subcommand is a one-shot — it hits `/api/station_info`, prints a table, and exits. Same `--wavelog-url` / `--key-file` / `WAVELOG_BRIDGE_KEY` resolution as the daemon.
 
-**Limitations**:
+### Coexisting with GridTracker2 / JTAlert / other UDP consumers
+
+WSJT-X has **one** "UDP Server" destination — only one process can claim `127.0.0.1:2237` at a time. If you already run GridTracker2, JTAlert, or similar, both you and they want the WSJT-X feed. Three ways to arrange that:
+
+**A — GridTracker2's built-in forwarder (recommended if you already use GT2).** Leave WSJT-X pointing at GridTracker2 (`127.0.0.1:2237`) as you do today. In GridTracker2: **Settings → Forwarding → Add Forwarder**, point it at a free port like `127.0.0.1:2238`. Then run wavelog-bridge with `--wsjtx-listen 127.0.0.1:2238`. GT2 receives, processes, and forwards an unmodified copy of every packet to us.
+
+```sh
+wavelog-bridge ... --wsjtx --wsjtx-listen 127.0.0.1:2238 --station-id 1
+```
+
+**B — Multicast (cleanest at scale, no forwarders).** Configure WSJT-X to broadcast to `224.0.0.1:2237` (any 224.x.x.x address works); GridTracker2, wavelog-bridge, JTAlert, and anything else can all subscribe at once. wavelog-bridge detects a multicast address in `--wsjtx-listen` and configures `SO_REUSEADDR`/`SO_REUSEPORT` + the group join automatically.
+
+```sh
+# In WSJT-X: Settings → Reporting → UDP Server = 224.0.0.1, port 2237
+wavelog-bridge ... --wsjtx --wsjtx-listen 224.0.0.1:2237 --station-id 1
+```
+
+GridTracker2 supports listening on multicast too; check their docs to point it at the same group. The whole pipeline becomes pub/sub instead of point-to-point.
+
+**C — Skip GridTracker2 / replace it.** If you're not using GT2's waterfall/map features, just point WSJT-X straight at wavelog-bridge on `127.0.0.1:2237` (the default).
+
+**Note about WavelogGate**: WavelogGate listens on port `2333` for a *different* WSJT-X feed (the "N1MM Logger+" plaintext output, configured separately in WSJT-X's Reporting tab). If you've been running WavelogGate + GridTracker2 together, that's how — they're on different ports reading different feeds. wavelog-bridge uses the primary binary UDP feed (port 2237 by default), so the WavelogGate-on-2333 / GT2-on-2237 split doesn't apply.
+
+### Other limitations
+
 - Only `Logged ADIF` (type 12) is forwarded. The structured `QSO Logged` (type 5) message that precedes it is parsed and discarded to avoid double-logging.
 - No persistent retry queue. If Wavelog is unreachable longer than the standard `[0, 1, 4]` s retry schedule, the QSO is dropped with a `warn` log line. WavelogGate behaves the same way; if this matters for you, file an issue.
-- The listener is unicast on the loopback address only. Multicast (`224.0.0.1`) is deferred.
 - A bounded queue (32 entries) sits between the UDP listener and the POST worker; overflow is logged as `wsjtx POST queue full` and drops the newest datagram. In practice the queue holds ~30 s of contest-rate FT8 logs.
 
 ## Browsers (Safari note)
