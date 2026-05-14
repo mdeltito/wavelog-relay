@@ -18,7 +18,7 @@ use std::time::Duration;
 use axum::http::HeaderValue;
 use futures_util::StreamExt;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufStream};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::watch;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::http::HeaderValue as TungHeaderValue;
@@ -26,7 +26,7 @@ use tokio_tungstenite::tungstenite::protocol::Message as TungMessage;
 use wavelog_bridge::modes::ModeOverrides;
 use wavelog_bridge::wavelog::WavelogClient;
 use wavelog_bridge::ws::WsBandmapHandle;
-use wavelog_bridge::{listener, poller, rigctld, ws};
+use wavelog_bridge::{listener, poller, rigctld, ws, wsjtx};
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -100,7 +100,7 @@ async fn full_round_trip_outbound_and_inbound() {
         .respond_with(ResponseTemplate::new(200))
         .mount(&wavelog_server)
         .await;
-    let client = WavelogClient::new(&wavelog_server.uri(), "test-key", "FT-710", 100.0).unwrap();
+    let client = WavelogClient::new(&wavelog_server.uri(), "test-key").unwrap();
 
     // --- listener (real bind) ---
     let tcp_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -117,6 +117,8 @@ async fn full_round_trip_outbound_and_inbound() {
     let poller_task = tokio::spawn(poller::run(
         rig_handle.clone(),
         client,
+        "FT-710".into(),
+        100.0,
         ws_handle.clone(),
         Duration::from_millis(50),
         shutdown_rx.clone(),
@@ -226,4 +228,74 @@ async fn full_round_trip_outbound_and_inbound() {
     let _ = tokio::time::timeout(Duration::from_secs(2), listener_task).await;
     let _ = tokio::time::timeout(Duration::from_secs(2), ws_task).await;
     let _ = tokio::time::timeout(Duration::from_secs(2), rig_join).await;
+}
+
+const WSJTX_MAGIC: u32 = 0xadbc_cbda;
+const WSJTX_MSG_LOGGED_ADIF: u32 = 12;
+
+/// Construct a WSJT-X `Logged ADIF` (type 12) UDP datagram by hand so
+/// the integration test doesn't need a running WSJT-X instance.
+fn encode_wsjtx_logged_adif(id: &str, adif: &str) -> Vec<u8> {
+    fn push_qstring(out: &mut Vec<u8>, s: &str) {
+        out.extend_from_slice(&(s.len() as i32).to_be_bytes());
+        out.extend_from_slice(s.as_bytes());
+    }
+    let mut out = Vec::new();
+    out.extend_from_slice(&WSJTX_MAGIC.to_be_bytes());
+    out.extend_from_slice(&3u32.to_be_bytes()); // schema version
+    out.extend_from_slice(&WSJTX_MSG_LOGGED_ADIF.to_be_bytes());
+    push_qstring(&mut out, id);
+    push_qstring(&mut out, adif);
+    out
+}
+
+#[tokio::test]
+async fn wsjtx_udp_message_forwards_to_wavelog_qso_endpoint() {
+    // --- wiremock Wavelog with /api/qso ---
+    let wavelog_server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/qso"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "status": "created",
+        })))
+        .mount(&wavelog_server)
+        .await;
+
+    // --- bind UDP socket on ephemeral port ---
+    let udp_listener = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let listen_addr = udp_listener.local_addr().unwrap();
+
+    let qso_client = WavelogClient::new(&wavelog_server.uri(), "test-key").unwrap();
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let (listener_task, worker_task) =
+        wsjtx::spawn(udp_listener, qso_client, "5".into(), shutdown_rx);
+
+    // --- send a WSJT-X type-12 packet ---
+    let sender = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let adif = "<CALL:5>VK3AB <MODE:3>FT8 <FREQ:8>14.07400 <EOR>";
+    let pkt = encode_wsjtx_logged_adif("WSJT-X", adif);
+    sender.send_to(&pkt, listen_addr).await.unwrap();
+
+    // --- spin for the POST to land ---
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let body = loop {
+        let requests = wavelog_server.received_requests().await.unwrap_or_default();
+        if !requests.is_empty() {
+            break serde_json::from_slice::<serde_json::Value>(&requests[0].body).unwrap();
+        }
+        if tokio::time::Instant::now() >= deadline {
+            panic!("wavelog never received the QSO POST");
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+
+    assert_eq!(body["key"], "test-key");
+    assert_eq!(body["station_profile_id"], "5");
+    assert_eq!(body["type"], "adif");
+    assert_eq!(body["string"], adif);
+
+    // --- shutdown ---
+    let _ = shutdown_tx.send(true);
+    let _ = tokio::time::timeout(Duration::from_secs(2), listener_task).await;
+    let _ = tokio::time::timeout(Duration::from_secs(2), worker_task).await;
 }

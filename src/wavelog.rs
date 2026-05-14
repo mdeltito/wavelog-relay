@@ -1,27 +1,39 @@
-//! Wavelog `/api/radio` push client.
+//! Wavelog HTTP client.
 //!
-//! [`WavelogClient::push`] handles the full cycle for a single
-//! [`RigState`] sample: quantize the RFPOWER reading into 0.5 %-of-full-
-//! scale bins (so the heartbeat path isn't drowned out on a QRP rig
-//! with a small `--power-max`), check the `(freq, mode, rfpower_q)`
-//! dedupe key against the last successful push (with a 30 s heartbeat
-//! that forces a re-POST even when nothing changed), POST the JSON
-//! payload with bounded retries (`[0 s, 1 s, 4 s]` before attempts
-//! 1, 2, 3 on network/5xx errors; 4xx fails immediately), and update
-//! the dedupe state only on a 2xx response so a transient Wavelog
-//! outage doesn't silently swallow a real QSY.
+//! A single [`WavelogClient`] handles every Wavelog endpoint the bridge
+//! talks to:
+//!
+//! - [`push_radio`](WavelogClient::push_radio) — `POST /api/radio`,
+//!   used by the poller for live rig-state updates. **Stateless**: the
+//!   poller is responsible for any dedupe / heartbeat policy. Wavelog
+//!   accepts the radio POST when HTTP status is 2xx; body is ignored.
+//! - [`push_qso`](WavelogClient::push_qso) — `POST /api/qso`, used by
+//!   the WSJT-X listener to forward ADIF log entries. Wavelog signals
+//!   success via the JSON `status: "created"` field, so 2xx alone is
+//!   not enough; anything else surfaces as [`WavelogError::Rejected`].
+//! - [`list_stations`](WavelogClient::list_stations) —
+//!   `GET /api/station_info/<key>`, used by the `stations` subcommand
+//!   for ID discovery.
+//!
+//! All POST methods share a single retry helper: `[0, 1, 4]` s sleeps
+//! before attempts 1, 2, 3 on transport errors / 5xx; 4xx and
+//! `Rejected` are non-retryable.
+//!
+//! The client owns nothing per-call: it's [`Clone`] (the inner
+//! `reqwest::Client` is internally `Arc`-shared) and safe to share
+//! between the poller, the WSJT-X worker, and the one-shot
+//! subcommand.
 
 use std::fmt;
+use std::future::Future;
 use std::time::Duration;
 
 use reqwest::Url;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
-use tokio::time::Instant;
 
 use crate::rigctld::RigState;
 
-const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
 const RETRY_SLEEPS: [Duration; 3] = [
     Duration::from_secs(0),
     Duration::from_secs(1),
@@ -30,25 +42,20 @@ const RETRY_SLEEPS: [Duration; 3] = [
 const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 const USER_AGENT: &str = concat!("wavelog-bridge/", env!("CARGO_PKG_VERSION"));
 
+#[derive(Clone)]
 pub struct WavelogClient {
     http: reqwest::Client,
-    endpoint: Url,
+    /// Trimmed base URL, e.g. `https://wavelog.example.com/index.php`.
+    /// No trailing slash; endpoints are derived per call.
+    base_url: Box<str>,
     key: Box<str>,
-    radio: Box<str>,
-    power_max_watts: f32,
-    last_pushed: Option<DedupeKey>,
-    last_push_time: Option<Instant>,
 }
 
 impl fmt::Debug for WavelogClient {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("WavelogClient")
-            .field("endpoint", &self.endpoint)
-            .field("radio", &self.radio)
+            .field("base_url", &self.base_url)
             .field("key", &Redacted(&self.key))
-            .field("power_max_watts", &self.power_max_watts)
-            .field("last_pushed", &self.last_pushed)
-            .field("last_push_time", &self.last_push_time)
             .finish()
     }
 }
@@ -65,11 +72,14 @@ impl fmt::Debug for Redacted<'_> {
     }
 }
 
+/// A Wavelog station-profile entry as returned by `/api/station_info`.
+/// `id` is the value to pass as `station_profile_id` when submitting
+/// QSOs to `/api/qso`.
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct DedupeKey {
-    freq: u64,
-    mode: Box<str>,
-    rfpower_q: i32,
+pub struct Station {
+    pub id: Box<str>,
+    pub name: Box<str>,
+    pub callsign: Box<str>,
 }
 
 #[derive(Debug, Error)]
@@ -82,128 +92,72 @@ pub enum WavelogError {
 
     #[error("wavelog returned HTTP {status}: {body}")]
     Status { status: u16, body: Box<str> },
+
+    /// Wavelog returned an HTTP 2xx but the JSON body's `status` field
+    /// was something other than `"created"` — duplicate QSO, validation
+    /// failure, etc. Not retryable: the transport succeeded; only the
+    /// logical operation failed.
+    #[error("wavelog rejected the submission: {reason}")]
+    Rejected { reason: Box<str> },
+
+    #[error("wavelog response could not be parsed: {0}")]
+    BadResponse(Box<str>),
 }
 
 impl WavelogClient {
-    /// Construct a client targeting `<base_url>/api/radio` with a
-    /// 5-second per-request timeout. The base URL's trailing slash is
-    /// trimmed if present.
-    pub fn new(
-        base_url: &str,
-        key: &str,
-        radio: &str,
-        power_max_watts: f32,
-    ) -> Result<Self, WavelogError> {
+    /// Construct a client for the given Wavelog base URL with the
+    /// standard 5-second per-request timeout. The base URL's trailing
+    /// slash is trimmed if present.
+    pub fn new(base_url: &str, key: &str) -> Result<Self, WavelogError> {
         let http = reqwest::Client::builder()
             .user_agent(USER_AGENT)
             .timeout(DEFAULT_REQUEST_TIMEOUT)
             .build()?;
-        Self::with_http(base_url, key, radio, power_max_watts, http)
+        Self::with_http(base_url, key, http)
     }
 
-    fn with_http(
-        base_url: &str,
-        key: &str,
-        radio: &str,
-        power_max_watts: f32,
-        http: reqwest::Client,
-    ) -> Result<Self, WavelogError> {
-        let endpoint = format!("{}/api/radio", base_url.trim_end_matches('/'))
-            .parse::<Url>()
-            .map_err(|_| WavelogError::InvalidUrl(base_url.into()))?;
+    fn with_http(base_url: &str, key: &str, http: reqwest::Client) -> Result<Self, WavelogError> {
+        let trimmed = base_url.trim_end_matches('/');
+        // Validate URL shape now so the daemon fails fast at startup
+        // rather than per-request.
+        let _ = build_url(trimmed, "radio")?;
         Ok(Self {
             http,
-            endpoint,
+            base_url: trimmed.into(),
             key: key.into(),
-            radio: radio.into(),
-            power_max_watts,
-            last_pushed: None,
-            last_push_time: None,
         })
     }
 
-    /// Push a single rig-state sample. Returns `Ok(())` on a successful
-    /// POST or a dedupe-skip; returns `Err` only when all retries are
-    /// exhausted or the response is a non-retryable error (4xx).
-    pub async fn push(&mut self, state: &RigState) -> Result<(), WavelogError> {
-        let watts = state.power * self.power_max_watts;
-        let rfpower_q = quantize_rfpower(state.power);
-        let now = Instant::now();
-
-        if self.should_skip(state, rfpower_q, now) {
-            tracing::debug!(
-                freq = state.freq,
-                mode = %state.mode,
-                "wavelog push deduped"
-            );
-            return Ok(());
-        }
-
-        let payload = PushPayload {
+    /// POST a radio-state snapshot to `/api/radio`. Returns `Ok(())`
+    /// on a successful 2xx; non-2xx surfaces as
+    /// [`WavelogError::Status`]. Stateless — dedupe / heartbeat is the
+    /// caller's responsibility.
+    pub async fn push_radio(
+        &self,
+        radio: &str,
+        state: &RigState,
+        power_max_watts: f32,
+    ) -> Result<(), WavelogError> {
+        let url = build_url(&self.base_url, "radio")?;
+        let payload = RadioPayload {
             key: &self.key,
-            radio: &self.radio,
+            radio,
             frequency: state.freq,
             mode: &state.mode,
-            power: watts,
+            power: state.power * power_max_watts,
         };
-        self.send_with_retries(&payload).await?;
-
-        self.last_pushed = Some(DedupeKey {
-            freq: state.freq,
-            mode: state.mode.clone(),
-            rfpower_q,
-        });
-        self.last_push_time = Some(now);
-        Ok(())
+        with_retries("push_radio", || async {
+            self.do_radio_post(&url, &payload).await
+        })
+        .await
     }
 
-    fn should_skip(&self, state: &RigState, rfpower_q: i32, now: Instant) -> bool {
-        let (Some(last), Some(last_time)) = (&self.last_pushed, self.last_push_time) else {
-            return false;
-        };
-        last.freq == state.freq
-            && *last.mode == *state.mode
-            && last.rfpower_q == rfpower_q
-            && now.duration_since(last_time) < HEARTBEAT_INTERVAL
-    }
-
-    async fn send_with_retries(&self, payload: &PushPayload<'_>) -> Result<(), WavelogError> {
-        let mut last_err: Option<WavelogError> = None;
-        for (idx, sleep) in RETRY_SLEEPS.iter().enumerate() {
-            if !sleep.is_zero() {
-                tokio::time::sleep(*sleep).await;
-            }
-            match self.do_post(payload).await {
-                Ok(()) => {
-                    tracing::debug!(attempt = idx + 1, "wavelog push sent");
-                    return Ok(());
-                },
-                Err(e) if !is_retryable(&e) => {
-                    tracing::warn!(error = %e, "wavelog push failed (non-retryable)");
-                    return Err(e);
-                },
-                Err(e) => {
-                    tracing::warn!(
-                        attempt = idx + 1,
-                        error = %e,
-                        "wavelog push failed; will retry",
-                    );
-                    last_err = Some(e);
-                },
-            }
-        }
-        let err = last_err.expect("retry loop must have produced an error");
-        tracing::warn!(error = %err, "wavelog push exhausted retries");
-        Err(err)
-    }
-
-    async fn do_post(&self, payload: &PushPayload<'_>) -> Result<(), WavelogError> {
-        let response = self
-            .http
-            .post(self.endpoint.clone())
-            .json(payload)
-            .send()
-            .await?;
+    async fn do_radio_post(
+        &self,
+        url: &Url,
+        payload: &RadioPayload<'_>,
+    ) -> Result<(), WavelogError> {
+        let response = self.http.post(url.clone()).json(payload).send().await?;
         let status = response.status();
         if status.is_success() {
             return Ok(());
@@ -214,10 +168,126 @@ impl WavelogClient {
             body: body.into(),
         })
     }
+
+    /// POST a logged QSO to `/api/qso` as `{ type: "adif", string:
+    /// <adif> }`. Success requires both HTTP 2xx **and** a response
+    /// JSON `status: "created"`; non-`created` 2xx responses surface
+    /// as [`WavelogError::Rejected`].
+    pub async fn push_qso(&self, station_id: &str, adif: &str) -> Result<(), WavelogError> {
+        let url = build_url(&self.base_url, "qso")?;
+        let payload = QsoPayload {
+            key: &self.key,
+            station_profile_id: station_id,
+            kind: "adif",
+            string: adif,
+        };
+        with_retries("push_qso", || async {
+            self.do_qso_post(&url, &payload).await
+        })
+        .await
+    }
+
+    async fn do_qso_post(&self, url: &Url, payload: &QsoPayload<'_>) -> Result<(), WavelogError> {
+        let response = self.http.post(url.clone()).json(payload).send().await?;
+        let status = response.status();
+        if !status.is_success() {
+            let body = response.text().await.unwrap_or_default();
+            return Err(WavelogError::Status {
+                status: status.as_u16(),
+                body: body.into(),
+            });
+        }
+        let body = response.text().await.unwrap_or_default();
+        let parsed: QsoResponse = serde_json::from_str(&body)
+            .map_err(|e| WavelogError::BadResponse(format!("{e}: {body}").into()))?;
+        if parsed.status.as_deref() == Some("created") {
+            return Ok(());
+        }
+        let reason = parsed
+            .reason
+            .or(parsed.status)
+            .unwrap_or_else(|| "unknown".to_owned());
+        Err(WavelogError::Rejected {
+            reason: reason.into(),
+        })
+    }
+
+    /// Fetch the list of station profiles configured in Wavelog for
+    /// the API key this client was constructed with. One-shot — no
+    /// retries — used by the `stations` subcommand.
+    pub async fn list_stations(&self) -> Result<Vec<Station>, WavelogError> {
+        let url = build_station_info_url(&self.base_url, &self.key)?;
+        let response = self.http.get(url).send().await?;
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        if !status.is_success() {
+            return Err(WavelogError::Status {
+                status: status.as_u16(),
+                body: body.into(),
+            });
+        }
+        let raw: Vec<StationInfoRow> = serde_json::from_str(&body)
+            .map_err(|e| WavelogError::BadResponse(format!("{e}: {body}").into()))?;
+        Ok(raw.into_iter().map(Station::from).collect())
+    }
+}
+
+/// Single retry helper shared by every POST. The closure must return
+/// a future that resolves to `Result<T, WavelogError>`; classification
+/// is delegated to [`is_retryable`].
+async fn with_retries<T, F, Fut>(label: &'static str, mut attempt: F) -> Result<T, WavelogError>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<T, WavelogError>>,
+{
+    let mut last_err: Option<WavelogError> = None;
+    for (idx, sleep) in RETRY_SLEEPS.iter().enumerate() {
+        if !sleep.is_zero() {
+            tokio::time::sleep(*sleep).await;
+        }
+        match attempt().await {
+            Ok(v) => {
+                tracing::debug!(label, attempt = idx + 1, "wavelog request sent");
+                return Ok(v);
+            },
+            Err(e) if !is_retryable(&e) => {
+                tracing::warn!(label, error = %e, "wavelog request failed (non-retryable)");
+                return Err(e);
+            },
+            Err(e) => {
+                tracing::warn!(
+                    label,
+                    attempt = idx + 1,
+                    error = %e,
+                    "wavelog request failed; will retry",
+                );
+                last_err = Some(e);
+            },
+        }
+    }
+    let err = last_err.expect("retry loop must have produced an error");
+    tracing::warn!(label, error = %err, "wavelog request exhausted retries");
+    Err(err)
+}
+
+fn build_url(base_url: &str, suffix: &str) -> Result<Url, WavelogError> {
+    format!("{}/api/{suffix}", base_url.trim_end_matches('/'))
+        .parse::<Url>()
+        .map_err(|_| WavelogError::InvalidUrl(base_url.into()))
+}
+
+fn build_station_info_url(base_url: &str, key: &str) -> Result<Url, WavelogError> {
+    let mut url = build_url(base_url, "station_info")?;
+    // path_segments_mut handles percent-encoding for keys that may
+    // contain characters outside the URL-safe set.
+    url.path_segments_mut()
+        .map_err(|_| WavelogError::InvalidUrl(base_url.into()))?
+        .push(key);
+    Ok(url)
 }
 
 #[derive(Serialize)]
-struct PushPayload<'a> {
+struct RadioPayload<'a> {
     key: &'a str,
     radio: &'a str,
     frequency: u64,
@@ -225,27 +295,50 @@ struct PushPayload<'a> {
     power: f32,
 }
 
-/// Quantize an RFPOWER reading (`0.0..=1.0`) into half-percent bins of
-/// full scale. The dedupe key compares on this quantized value so a
-/// continuously-drifting RFPOWER doesn't generate one POST per tick;
-/// keeping the bin relative (rather than fixed at 0.5 W) means a
-/// low-`power_max` rig still benefits from dedupe.
-fn quantize_rfpower(rfpower: f32) -> i32 {
-    (rfpower * 200.0).round() as i32
+#[derive(Serialize)]
+struct QsoPayload<'a> {
+    key: &'a str,
+    station_profile_id: &'a str,
+    #[serde(rename = "type")]
+    kind: &'a str,
+    string: &'a str,
+}
+
+#[derive(Deserialize)]
+struct QsoResponse {
+    status: Option<String>,
+    reason: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct StationInfoRow {
+    station_id: String,
+    station_profile_name: String,
+    station_callsign: String,
+}
+
+impl From<StationInfoRow> for Station {
+    fn from(row: StationInfoRow) -> Self {
+        Self {
+            id: row.station_id.into(),
+            name: row.station_profile_name.into(),
+            callsign: row.station_callsign.into(),
+        }
+    }
 }
 
 fn is_retryable(err: &WavelogError) -> bool {
     match err {
         WavelogError::Http(_) => true,
         WavelogError::Status { status, .. } => *status >= 500,
-        WavelogError::InvalidUrl(_) => false,
+        WavelogError::InvalidUrl(_)
+        | WavelogError::Rejected { .. }
+        | WavelogError::BadResponse(_) => false,
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
-
     use serde_json::Value;
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -260,7 +353,15 @@ mod tests {
         }
     }
 
-    async fn server_with_response(template: ResponseTemplate) -> MockServer {
+    /// Build a client without the production reqwest timeout. Tests
+    /// that use `tokio::time::pause()` need this because tokio's
+    /// auto-advance would otherwise fire the timer during the real
+    /// wiremock round-trip and surface a spurious `TimedOut` error.
+    fn client_for(server: &MockServer) -> WavelogClient {
+        WavelogClient::with_http(&server.uri(), "test-key", reqwest::Client::new()).unwrap()
+    }
+
+    async fn radio_server_with_response(template: ResponseTemplate) -> MockServer {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/api/radio"))
@@ -270,98 +371,34 @@ mod tests {
         server
     }
 
-    /// Build a client without the production reqwest timeout. Tests
-    /// that use `tokio::time::pause()` need this because tokio's
-    /// auto-advance would otherwise fire the timer during the real
-    /// wiremock round-trip and surface a spurious `TimedOut` error.
-    async fn client_for(server: &MockServer) -> WavelogClient {
-        WavelogClient::with_http(
-            &server.uri(),
-            "test-key",
-            "FT-710",
-            100.0,
-            reqwest::Client::new(),
-        )
-        .unwrap()
-    }
-
-    #[test]
-    fn quantize_rfpower_rounds_to_half_percent_bins() {
-        assert_eq!(quantize_rfpower(0.0), 0);
-        assert_eq!(quantize_rfpower(0.10), 20); // 0.10 * 200 = 20
-        assert_eq!(quantize_rfpower(0.102), 20); // 20.4 -> 20
-        assert_eq!(quantize_rfpower(0.103), 21); // 20.6 -> 21
-        assert_eq!(quantize_rfpower(0.105), 21); // 21.0 -> 21
-        assert_eq!(quantize_rfpower(0.997), 199); // 199.4 -> 199
-        assert_eq!(quantize_rfpower(0.998), 200); // 199.6 -> 200
-        assert_eq!(quantize_rfpower(1.0), 200);
-    }
-
-    #[test]
-    fn quantize_is_independent_of_power_max() {
-        // A 5W QRP rig (power_max=5) and a 100W rig (power_max=100)
-        // both quantize the same RFPOWER fraction identically — that's
-        // the point of operating on the raw fraction rather than watts.
-        assert_eq!(quantize_rfpower(0.5), 100);
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn qrp_rig_is_not_dedupe_starved_by_small_power_max() {
-        // Regression test: with the old per-watt quantization, a 5W rig
-        // saw 0.5W bins = 10% of full scale, so any sub-10% RFPOWER
-        // swing collapsed to one bin and dedupe ate the heartbeat.
-        // With per-RFPOWER bins, 0.10 vs 0.20 RFPOWER (10% delta)
-        // still crosses ~20 bins regardless of power_max.
-        let server = server_with_response(ResponseTemplate::new(200)).await;
-        let mut client =
-            WavelogClient::with_http(&server.uri(), "k", "QRP", 5.0, reqwest::Client::new())
-                .unwrap();
-        client
-            .push(&rig_state(14_074_000, "USB", 0.10))
-            .await
-            .unwrap();
-        client
-            .push(&rig_state(14_074_000, "USB", 0.20))
-            .await
-            .unwrap();
-        assert_eq!(server.received_requests().await.unwrap().len(), 2);
+    fn qso_created_response() -> ResponseTemplate {
+        ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "status": "created",
+            "reason": "",
+        }))
     }
 
     #[test]
     fn redacted_debug_hides_key_body() {
-        let client = WavelogClient::with_http(
-            "http://localhost",
-            "supersecret",
-            "r",
-            100.0,
-            reqwest::Client::new(),
-        )
-        .unwrap();
+        let client =
+            WavelogClient::with_http("http://localhost", "supersecret", reqwest::Client::new())
+                .unwrap();
         let dbg = format!("{client:?}");
-        assert!(
-            !dbg.contains("supersecret"),
-            "raw key leaked into Debug: {dbg}"
-        );
-        assert!(dbg.contains("****cret"), "missing redacted tail in: {dbg}");
+        assert!(!dbg.contains("supersecret"), "key leaked: {dbg}");
+        assert!(dbg.contains("****cret"));
     }
 
     #[test]
     fn redacted_debug_short_key_fully_masked() {
-        let client = WavelogClient::with_http(
-            "http://localhost",
-            "abc",
-            "r",
-            100.0,
-            reqwest::Client::new(),
-        )
-        .unwrap();
+        let client =
+            WavelogClient::with_http("http://localhost", "abc", reqwest::Client::new()).unwrap();
         let dbg = format!("{client:?}");
-        assert!(!dbg.contains("abc"), "short key leaked: {dbg}");
+        assert!(!dbg.contains("abc"), "key leaked: {dbg}");
         assert!(dbg.contains("****"));
     }
 
     #[test]
-    fn is_retryable_classifies_status_codes() {
+    fn is_retryable_classifies_variants() {
         assert!(is_retryable(&WavelogError::Status {
             status: 500,
             body: "".into()
@@ -379,20 +416,37 @@ mod tests {
             body: "".into()
         }));
         assert!(!is_retryable(&WavelogError::InvalidUrl("".into())));
+        assert!(!is_retryable(&WavelogError::Rejected {
+            reason: "dup".into()
+        }));
+        assert!(!is_retryable(&WavelogError::BadResponse("garbage".into())));
     }
 
     #[test]
     fn new_rejects_unparseable_url() {
-        let err = WavelogClient::new("not a url", "k", "r", 100.0).unwrap_err();
+        let err = WavelogClient::new("not a url", "k").unwrap_err();
         assert!(matches!(err, WavelogError::InvalidUrl(_)));
     }
 
+    #[test]
+    fn build_station_info_url_percent_encodes_key() {
+        let url = build_station_info_url("https://wavelog.test", "key with spaces").unwrap();
+        assert!(
+            url.path()
+                .ends_with("/api/station_info/key%20with%20spaces"),
+            "got {}",
+            url.path()
+        );
+    }
+
+    // -- push_radio --
+
     #[tokio::test]
-    async fn json_body_has_required_fields_and_omits_split_fields() {
-        let server = server_with_response(ResponseTemplate::new(200)).await;
-        let mut client = client_for(&server).await;
+    async fn push_radio_posts_expected_json_body() {
+        let server = radio_server_with_response(ResponseTemplate::new(200)).await;
+        let client = client_for(&server);
         client
-            .push(&rig_state(14_074_000, "USB", 0.1))
+            .push_radio("FT-710", &rig_state(14_074_000, "USB", 0.1), 100.0)
             .await
             .unwrap();
 
@@ -404,18 +458,18 @@ mod tests {
         assert_eq!(body["frequency"], 14_074_000);
         assert_eq!(body["mode"], "USB");
         assert!((body["power"].as_f64().unwrap() - 10.0).abs() < 1e-3);
-        assert!(body.get("frequency_rx").is_none(), "no split fields in v1");
-        assert!(body.get("mode_rx").is_none(), "no split fields in v1");
-        assert!(body.get("timestamp").is_none(), "no timestamp in v1");
+        assert!(body.get("frequency_rx").is_none());
+        assert!(body.get("mode_rx").is_none());
+        assert!(body.get("timestamp").is_none());
     }
 
     #[tokio::test]
-    async fn power_conversion_scales_by_power_max_watts() {
-        let server = server_with_response(ResponseTemplate::new(200)).await;
-        // power_max = 50 W: RFPOWER 0.2 -> 10.0 W
-        let mut client = WavelogClient::new(&server.uri(), "k", "FT-710", 50.0).unwrap();
+    async fn push_radio_scales_power_by_power_max_watts() {
+        let server = radio_server_with_response(ResponseTemplate::new(200)).await;
+        let client = client_for(&server);
+        // power_max=50, fraction=0.2 -> 10W
         client
-            .push(&rig_state(14_074_000, "USB", 0.2))
+            .push_radio("FT-710", &rig_state(14_074_000, "USB", 0.2), 50.0)
             .await
             .unwrap();
 
@@ -425,94 +479,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn small_rfpower_fluctuation_quantizes_into_dedupe() {
-        let server = server_with_response(ResponseTemplate::new(200)).await;
-        let mut client = client_for(&server).await;
-        // 0.100 -> 10.0 W -> 20 half-W. 0.101 -> 10.1 W -> 20.2 -> 20 half-W.
-        client
-            .push(&rig_state(14_074_000, "USB", 0.100))
-            .await
-            .unwrap();
-        client
-            .push(&rig_state(14_074_000, "USB", 0.101))
-            .await
-            .unwrap();
-        assert_eq!(server.received_requests().await.unwrap().len(), 1);
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn power_change_beyond_quantum_sends_new_post() {
-        let server = server_with_response(ResponseTemplate::new(200)).await;
-        let mut client = client_for(&server).await;
-        client
-            .push(&rig_state(14_074_000, "USB", 0.10))
-            .await
-            .unwrap();
-        client
-            .push(&rig_state(14_074_000, "USB", 0.15))
-            .await
-            .unwrap();
-        assert_eq!(server.received_requests().await.unwrap().len(), 2);
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn freq_change_breaks_dedupe() {
-        let server = server_with_response(ResponseTemplate::new(200)).await;
-        let mut client = client_for(&server).await;
-        client
-            .push(&rig_state(14_074_000, "USB", 0.1))
-            .await
-            .unwrap();
-        client
-            .push(&rig_state(14_100_000, "USB", 0.1))
-            .await
-            .unwrap();
-        assert_eq!(server.received_requests().await.unwrap().len(), 2);
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn mode_change_breaks_dedupe() {
-        let server = server_with_response(ResponseTemplate::new(200)).await;
-        let mut client = client_for(&server).await;
-        client
-            .push(&rig_state(14_074_000, "USB", 0.1))
-            .await
-            .unwrap();
-        client
-            .push(&rig_state(14_074_000, "CW", 0.1))
-            .await
-            .unwrap();
-        assert_eq!(server.received_requests().await.unwrap().len(), 2);
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn heartbeat_after_30s_resends_unchanged_state() {
-        let server = server_with_response(ResponseTemplate::new(200)).await;
-        let mut client = client_for(&server).await;
-        let state = rig_state(14_074_000, "USB", 0.1);
-
-        client.push(&state).await.unwrap();
-        tokio::time::advance(Duration::from_secs(31)).await;
-        client.push(&state).await.unwrap();
-
-        assert_eq!(server.received_requests().await.unwrap().len(), 2);
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn unchanged_state_within_30s_is_skipped() {
-        let server = server_with_response(ResponseTemplate::new(200)).await;
-        let mut client = client_for(&server).await;
-        let state = rig_state(14_074_000, "USB", 0.1);
-
-        client.push(&state).await.unwrap();
-        tokio::time::advance(Duration::from_secs(10)).await;
-        client.push(&state).await.unwrap();
-
-        assert_eq!(server.received_requests().await.unwrap().len(), 1);
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn retries_on_5xx_then_succeeds() {
+    async fn push_radio_retries_on_5xx_then_succeeds() {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/api/radio"))
@@ -525,21 +492,20 @@ mod tests {
             .respond_with(ResponseTemplate::new(200))
             .mount(&server)
             .await;
-
-        let mut client = client_for(&server).await;
+        let client = client_for(&server);
         client
-            .push(&rig_state(14_074_000, "USB", 0.1))
+            .push_radio("FT-710", &rig_state(14_074_000, "USB", 0.1), 100.0)
             .await
             .unwrap();
         assert_eq!(server.received_requests().await.unwrap().len(), 3);
     }
 
     #[tokio::test(start_paused = true)]
-    async fn all_5xx_returns_error_after_three_attempts() {
-        let server = server_with_response(ResponseTemplate::new(503)).await;
-        let mut client = client_for(&server).await;
+    async fn push_radio_all_5xx_returns_error_after_three_attempts() {
+        let server = radio_server_with_response(ResponseTemplate::new(503)).await;
+        let client = client_for(&server);
         let err = client
-            .push(&rig_state(14_074_000, "USB", 0.1))
+            .push_radio("FT-710", &rig_state(14_074_000, "USB", 0.1), 100.0)
             .await
             .unwrap_err();
         assert!(
@@ -550,11 +516,11 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn does_not_retry_on_4xx() {
-        let server = server_with_response(ResponseTemplate::new(400)).await;
-        let mut client = client_for(&server).await;
+    async fn push_radio_does_not_retry_on_4xx() {
+        let server = radio_server_with_response(ResponseTemplate::new(400)).await;
+        let client = client_for(&server);
         let err = client
-            .push(&rig_state(14_074_000, "USB", 0.1))
+            .push_radio("FT-710", &rig_state(14_074_000, "USB", 0.1), 100.0)
             .await
             .unwrap_err();
         assert!(
@@ -564,32 +530,145 @@ mod tests {
         assert_eq!(server.received_requests().await.unwrap().len(), 1);
     }
 
-    #[tokio::test(start_paused = true)]
-    async fn dedupe_state_persists_only_after_successful_push() {
+    // -- push_qso --
+
+    #[tokio::test]
+    async fn push_qso_posts_adif_payload() {
         let server = MockServer::start().await;
-        // First push: all three attempts get 500.
         Mock::given(method("POST"))
-            .and(path("/api/radio"))
-            .respond_with(ResponseTemplate::new(500))
-            .up_to_n_times(3)
+            .and(path("/api/qso"))
+            .respond_with(qso_created_response())
             .mount(&server)
             .await;
-        // Subsequent requests succeed.
+        let client = client_for(&server);
+
+        client
+            .push_qso("3", "<CALL:3>K1B <MODE:3>FT8 <EOR>")
+            .await
+            .unwrap();
+
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 1);
+        let body: Value = serde_json::from_slice(&requests[0].body).unwrap();
+        assert_eq!(body["key"], "test-key");
+        assert_eq!(body["station_profile_id"], "3");
+        assert_eq!(body["type"], "adif");
+        assert_eq!(body["string"], "<CALL:3>K1B <MODE:3>FT8 <EOR>");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn push_qso_treats_200_with_non_created_status_as_rejection() {
+        let server = MockServer::start().await;
         Mock::given(method("POST"))
-            .and(path("/api/radio"))
-            .respond_with(ResponseTemplate::new(200))
+            .and(path("/api/qso"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "status": "rejected",
+                "reason": "duplicate qso",
+            })))
             .mount(&server)
             .await;
+        let client = client_for(&server);
+        let err = client.push_qso("3", "<EOR>").await.unwrap_err();
+        match err {
+            WavelogError::Rejected { reason } => assert_eq!(&*reason, "duplicate qso"),
+            other => panic!("expected Rejected, got {other:?}"),
+        }
+        // No retry on Rejected.
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+    }
 
-        let mut client = client_for(&server).await;
-        let state = rig_state(14_074_000, "USB", 0.1);
+    #[tokio::test(start_paused = true)]
+    async fn push_qso_retries_5xx_then_succeeds() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/qso"))
+            .respond_with(ResponseTemplate::new(503))
+            .up_to_n_times(2)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/qso"))
+            .respond_with(qso_created_response())
+            .mount(&server)
+            .await;
+        let client = client_for(&server);
+        client.push_qso("3", "<EOR>").await.unwrap();
+        assert_eq!(server.received_requests().await.unwrap().len(), 3);
+    }
 
-        // First push: 3 attempts all fail.
-        client.push(&state).await.unwrap_err();
-        // Same state again — must NOT be deduped because the previous
-        // push never succeeded. Should hit the 200 mock on the next try.
-        client.push(&state).await.unwrap();
+    #[tokio::test(start_paused = true)]
+    async fn push_qso_does_not_retry_on_4xx() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/qso"))
+            .respond_with(ResponseTemplate::new(401))
+            .mount(&server)
+            .await;
+        let client = client_for(&server);
+        let err = client.push_qso("3", "<EOR>").await.unwrap_err();
+        assert!(
+            matches!(err, WavelogError::Status { status: 401, .. }),
+            "got {err:?}"
+        );
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+    }
 
-        assert_eq!(server.received_requests().await.unwrap().len(), 4);
+    #[tokio::test]
+    async fn push_qso_unparseable_response_is_bad_response() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/qso"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("not json"))
+            .mount(&server)
+            .await;
+        let client = client_for(&server);
+        let err = client.push_qso("3", "<EOR>").await.unwrap_err();
+        assert!(matches!(err, WavelogError::BadResponse(_)), "got {err:?}");
+    }
+
+    // -- list_stations --
+
+    #[tokio::test]
+    async fn list_stations_parses_station_info_rows() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/station_info/test-key"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+                {
+                    "station_id": "1",
+                    "station_profile_name": "Home",
+                    "station_callsign": "K1AB",
+                },
+                {
+                    "station_id": "2",
+                    "station_profile_name": "Portable",
+                    "station_callsign": "K1AB/P",
+                }
+            ])))
+            .mount(&server)
+            .await;
+        let client = client_for(&server);
+        let stations = client.list_stations().await.unwrap();
+        assert_eq!(stations.len(), 2);
+        assert_eq!(&*stations[0].id, "1");
+        assert_eq!(&*stations[0].name, "Home");
+        assert_eq!(&*stations[0].callsign, "K1AB");
+        assert_eq!(&*stations[1].id, "2");
+    }
+
+    #[tokio::test]
+    async fn list_stations_surfaces_http_error_as_status() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/station_info/test-key"))
+            .respond_with(ResponseTemplate::new(403).set_body_string("forbidden"))
+            .mount(&server)
+            .await;
+        let client = client_for(&server);
+        let err = client.list_stations().await.unwrap_err();
+        assert!(
+            matches!(err, WavelogError::Status { status: 403, .. }),
+            "got {err:?}"
+        );
     }
 }

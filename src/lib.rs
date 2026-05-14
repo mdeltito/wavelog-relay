@@ -5,3 +5,4 @@ pub mod poller;
 pub mod rigctld;
 pub mod wavelog;
 pub mod ws;
+pub mod wsjtx;

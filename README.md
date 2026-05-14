@@ -4,13 +4,14 @@ Rust bridge between rigctld and Wavelog. One static binary, both directions:
 
 - **Outbound (HTTP)**: polls rigctld at 1 Hz and pushes rig state (frequency, mode, power) to Wavelog's `/api/radio`.
 - **Outbound (WebSocket bandmap)**: serves `ws://127.0.0.1:54322` and broadcasts `radio_status` frames to Wavelog's bandmap client every tick, so the rig card and bandmap update live instead of on the 3 s AJAX poll.
-- **Inbound**: listens on `127.0.0.1:54321` for Wavelog's click-to-tune callback and dispatches `F`/`M` commands to rigctld.
+- **Inbound (click-to-tune)**: listens on `127.0.0.1:54321` for Wavelog's click-to-tune callback and dispatches `F`/`M` commands to rigctld.
+- **Inbound (WSJT-X QSO log)**: opt-in via `--wsjtx`. When enabled, listens on `udp://127.0.0.1:2237` for WSJT-X's binary "network message" protocol and forwards each logged QSO (the `Logged ADIF` message) to Wavelog's `/api/qso`. Replaces WavelogGate's WSJT-X bridge.
 
 No GUI. Targets Linux and macOS. MIT.
 
 ## v1 scope
 
-Single rig, hamlib/rigctld only, single VFO. Multi-radio profiles, flrig XML-RPC, split-mode push, native WSS (port 54323), and forwarding the frontend's inbound bandmap messages (`qso_logged` → UDP, `satellite_position` / `lookup_result` → rotctld) are deferred.
+Single rig, hamlib/rigctld only, single VFO. Multi-radio profiles, flrig XML-RPC, split-mode push, native WSS (port 54323), forwarding the frontend's inbound bandmap messages (`qso_logged` → UDP, `satellite_position` / `lookup_result` → rotctld), and a persistent retry queue for WSJT-X QSOs are deferred.
 
 ## Build
 
@@ -49,6 +50,9 @@ Every flag also reads `WAVELOG_BRIDGE_<UPPERCASE>` from the environment:
 | `--listen <ADDR>` | `127.0.0.1:54321` | Click-to-tune listener bind |
 | `--ws-listen <ADDR>` | `127.0.0.1:54322` | WebSocket bandmap bind. Wavelog's frontend hardcodes this port — only change it if you're fronting the bridge with a reverse proxy |
 | `--no-ws` | _(off)_ | Disable the WebSocket bandmap server. Frontend falls back to its 3 s AJAX poll |
+| `--wsjtx` | _(off)_ | Enable the WSJT-X UDP listener for forwarding logged QSOs to Wavelog. Requires `--station-id` |
+| `--wsjtx-listen <ADDR>` | `127.0.0.1:2237` | WSJT-X UDP listener bind (honored only with `--wsjtx`). Must match WSJT-X's `Settings → Reporting → UDP Server` |
+| `--station-id <ID>` | _(required if `--wsjtx`)_ | Wavelog station profile ID for QSO submissions. Run `wavelog-bridge stations` to look up IDs |
 | `--interval <DUR>` | `1s` | Humantime: `1s`, `500ms`, etc. |
 | `--rig-timeout <DUR>` | `3s` | Per-command read timeout against rigctld. On expiry the connection is dropped and the actor reconnects via backoff |
 | `--config <PATH>` | _(auto)_ | Optional TOML; auto-discovered at `$XDG_CONFIG_HOME/wavelog-bridge/config.toml` |
@@ -78,6 +82,9 @@ power_max = 100.0
 listen = "127.0.0.1:54321"
 ws_listen = "127.0.0.1:54322"
 no_ws = false
+wsjtx = true
+wsjtx_listen = "127.0.0.1:2237"
+station_id = "1"
 interval = "1s"
 rig_timeout = "3s"
 log_level = "info"
@@ -155,6 +162,40 @@ Wavelog's frontend (`assets/js/cat.js`) opens a WebSocket to the local machine f
 Native WSS (54323) is deferred. If you need it today, terminate TLS in a reverse proxy and forward to `ws://127.0.0.1:54322`, or run with `--no-ws` and let the frontend fall back to its 3 s AJAX poll.
 
 The frontend will also send messages back over the socket (`qso_logged`, `satellite_position`, `lookup_result`) — wavelog-bridge accepts and discards these at debug log level. Forwarding to UDP (N1MM/JTDX) or rotctld is a future iteration with its own configuration.
+
+## WSJT-X QSO forwarding
+
+**Off by default.** Pass `--wsjtx` (or set `WAVELOG_BRIDGE_WSJTX=1`, or `wsjtx = true` in TOML) to enable.
+
+WSJT-X (and forks JTDX / MSHV) broadcast every logged QSO over UDP as a binary "network message". With `--wsjtx` set, wavelog-bridge listens on `udp://127.0.0.1:2237`, parses the `Logged ADIF` (type 12) message, and POSTs the ADIF string to Wavelog's `/api/qso` endpoint — completing a QSO in WSJT-X's Log QSO dialog appears in Wavelog within a second, no manual entry.
+
+**WSJT-X setup**: open **Settings → Reporting → UDP Server**.
+
+| Field | Value |
+|---|---|
+| UDP Server | `127.0.0.1` |
+| UDP Server port number | `2237` |
+| Accept UDP requests | (optional, no effect on us) |
+
+If you run JTDX or MSHV, the menu path and field names are the same — they speak the identical protocol.
+
+**Station profile ID**: Wavelog's `/api/qso` requires a `station_profile_id`. The daemon will not start with `--wsjtx` unless `--station-id` is set. Run the `stations` subcommand once to look it up:
+
+```sh
+wavelog-bridge stations
+# ID  NAME      CALLSIGN
+# --  --------  --------
+#  1  Home      K1AB
+#  2  Portable  K1AB/P
+```
+
+The `stations` subcommand is a one-shot — it hits `/api/station_info`, prints a table, and exits. Same `--wavelog-url` / `--key-file` / `WAVELOG_BRIDGE_KEY` resolution as the daemon.
+
+**Limitations**:
+- Only `Logged ADIF` (type 12) is forwarded. The structured `QSO Logged` (type 5) message that precedes it is parsed and discarded to avoid double-logging.
+- No persistent retry queue. If Wavelog is unreachable longer than the standard `[0, 1, 4]` s retry schedule, the QSO is dropped with a `warn` log line. WavelogGate behaves the same way; if this matters for you, file an issue.
+- The listener is unicast on the loopback address only. Multicast (`224.0.0.1`) is deferred.
+- A bounded queue (32 entries) sits between the UDP listener and the POST worker; overflow is logged as `wsjtx POST queue full` and drops the newest datagram. In practice the queue holds ~30 s of contest-rate FT8 logs.
 
 ## Browsers (Safari note)
 
