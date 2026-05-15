@@ -179,6 +179,15 @@ impl RigHandle {
             .await
     }
 
+    /// Set frequency and mode atomically on the actor's socket. The
+    /// actor writes `F`/reads `RPRT`/writes `M`/reads `RPRT` inside a
+    /// single command dispatch — no other queued command (notably the
+    /// poller's `f`/`m`/`\get_level RFPOWER`) can land between them.
+    pub async fn set_freq_mode(&self, hz: u64, mode: HamlibMode) -> Result<(), RigError> {
+        self.request(|reply| RigCommand::SetFreqMode { hz, mode, reply })
+            .await
+    }
+
     /// Read freq, mode and RFPOWER as a single state snapshot. Three
     /// sequential round trips through the actor; the actor processes
     /// commands one at a time, so the reads are interleaved with
@@ -212,6 +221,11 @@ enum RigCommand {
         reply: oneshot::Sender<Result<(), RigError>>,
     },
     SetMode {
+        mode: HamlibMode,
+        reply: oneshot::Sender<Result<(), RigError>>,
+    },
+    SetFreqMode {
+        hz: u64,
         mode: HamlibMode,
         reply: oneshot::Sender<Result<(), RigError>>,
     },
@@ -317,6 +331,9 @@ fn fail_command(cmd: RigCommand, err: RigError) {
         RigCommand::SetMode { reply, .. } => {
             let _ = reply.send(Err(err));
         },
+        RigCommand::SetFreqMode { reply, .. } => {
+            let _ = reply.send(Err(err));
+        },
     }
 }
 
@@ -327,6 +344,9 @@ async fn handle_command(conn: &mut Connection, cmd: RigCommand) -> io::Result<()
         RigCommand::GetPower(reply) => dispatch(reply, exec_get_power(conn)).await,
         RigCommand::SetFreq { hz, reply } => dispatch(reply, exec_set_freq(conn, hz)).await,
         RigCommand::SetMode { mode, reply } => dispatch(reply, exec_set_mode(conn, mode)).await,
+        RigCommand::SetFreqMode { hz, mode, reply } => {
+            dispatch(reply, exec_set_freq_mode(conn, hz, mode)).await
+        },
     }
 }
 
@@ -446,6 +466,22 @@ async fn exec_set_mode(
     // (RIG_PASSBAND_NORMAL) makes the backend apply the rig's default
     // passband for the new mode, which clobbers a user's tuned filter
     // every click-to-tune (e.g. FT-710 snapping back to 2400 Hz USB).
+    conn.send(&format!("M {mode_str} -1")).await?;
+    let line = conn.read_line().await?;
+    Ok(parse_set_response(line))
+}
+
+async fn exec_set_freq_mode(
+    conn: &mut Connection,
+    hz: u64,
+    mode: HamlibMode,
+) -> io::Result<Result<(), RigError>> {
+    conn.send(&format!("F {hz}")).await?;
+    let line = conn.read_line().await?;
+    if let Err(e) = parse_set_response(line) {
+        return Ok(Err(e));
+    }
+    let mode_str = mode.as_str();
     conn.send(&format!("M {mode_str} -1")).await?;
     let line = conn.read_line().await?;
     Ok(parse_set_response(line))
@@ -600,6 +636,88 @@ mod tests {
         let (handle, _join) = spawn(addr, TEST_TIMEOUT);
         handle.set_mode(HamlibMode::Usb).await.unwrap();
         handle.set_mode(HamlibMode::PktUsb).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn set_freq_mode_writes_f_then_m_back_to_back() {
+        // The mock asserts the exact ordering with no other commands in
+        // between — this is the property that prevents a poll tick from
+        // interleaving on the shared actor socket.
+        let addr = spawn_mock(|mut conn| async move {
+            conn.expect("F 28270000").await;
+            conn.reply("RPRT 0").await;
+            conn.expect("M USB -1").await;
+            conn.reply("RPRT 0").await;
+        })
+        .await;
+        let (handle, _join) = spawn(addr, TEST_TIMEOUT);
+        handle
+            .set_freq_mode(28_270_000, HamlibMode::Usb)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn set_freq_mode_skips_m_when_f_fails() {
+        let addr = spawn_mock(|mut conn| async move {
+            conn.expect("F 28270000").await;
+            conn.reply("RPRT -9").await;
+            // Hold open long enough to detect a stray `M` write.
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        })
+        .await;
+        let (handle, _join) = spawn(addr, TEST_TIMEOUT);
+        let err = handle
+            .set_freq_mode(28_270_000, HamlibMode::Usb)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, RigError::Hamlib(-9)), "got {err:?}");
+    }
+
+    #[tokio::test]
+    async fn set_freq_mode_surfaces_m_error() {
+        let addr = spawn_mock(|mut conn| async move {
+            conn.expect("F 28270000").await;
+            conn.reply("RPRT 0").await;
+            conn.expect("M USB -1").await;
+            conn.reply("RPRT -1").await;
+        })
+        .await;
+        let (handle, _join) = spawn(addr, TEST_TIMEOUT);
+        let err = handle
+            .set_freq_mode(28_270_000, HamlibMode::Usb)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, RigError::Hamlib(-1)), "got {err:?}");
+    }
+
+    #[tokio::test]
+    async fn set_freq_mode_is_atomic_against_concurrent_get_freq() {
+        // While set_freq_mode is in flight, another caller queues a
+        // get_freq. The mock asserts F → M → f at the wire; if the
+        // actor yielded between F and M the `f` would land in between
+        // and the mock's `expect("M ...")` would fail.
+        let addr = spawn_mock(|mut conn| async move {
+            conn.expect("F 28270000").await;
+            // Brief pause to give the racing get_freq time to queue.
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            conn.reply("RPRT 0").await;
+            conn.expect("M USB -1").await;
+            conn.reply("RPRT 0").await;
+            conn.expect("f").await;
+            conn.reply("28270000").await;
+        })
+        .await;
+        let (handle, _join) = spawn(addr, TEST_TIMEOUT);
+        let h2 = handle.clone();
+        let click =
+            tokio::spawn(async move { handle.set_freq_mode(28_270_000, HamlibMode::Usb).await });
+        // Queue the racing poll after the set_freq_mode has at least
+        // started writing to the socket.
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        let poll = tokio::spawn(async move { h2.get_freq().await });
+        click.await.unwrap().unwrap();
+        assert_eq!(poll.await.unwrap().unwrap(), 28_270_000);
     }
 
     #[tokio::test]

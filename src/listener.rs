@@ -99,12 +99,13 @@ async fn tune(
     };
     let hamlib = mode.resolve(&state.overrides);
 
-    if let Err(e) = state.rig.set_freq(freq).await {
-        tracing::warn!(error = %e, freq, "click-to-tune: set_freq failed");
-        return StatusCode::BAD_GATEWAY.into_response();
-    }
-    if let Err(e) = state.rig.set_mode(hamlib).await {
-        tracing::warn!(error = %e, mode = hamlib.as_str(), "click-to-tune: set_mode failed");
+    if let Err(e) = state.rig.set_freq_mode(freq, hamlib).await {
+        tracing::warn!(
+            error = %e,
+            freq,
+            mode = hamlib.as_str(),
+            "click-to-tune: set_freq_mode failed",
+        );
         return StatusCode::BAD_GATEWAY.into_response();
     }
 
