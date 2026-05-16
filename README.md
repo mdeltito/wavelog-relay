@@ -11,7 +11,7 @@ No GUI. Targets Linux and macOS. MIT.
 
 ## v1 scope
 
-Single rig, hamlib/rigctld only, single VFO. Multi-radio profiles, flrig XML-RPC, split-mode push, native WSS (port 54323), forwarding the frontend's inbound bandmap messages (`qso_logged` → UDP, `satellite_position` / `lookup_result` → rotctld), and a persistent retry queue for WSJT-X QSOs are deferred.
+Single rig, hamlib/rigctld only, single VFO. Multi-radio profiles, flrig XML-RPC, split-mode push, native WSS (port 54323), and forwarding the frontend's inbound bandmap messages (`qso_logged` → UDP, `satellite_position` / `lookup_result` → rotctld) are deferred.
 
 ## Build
 
