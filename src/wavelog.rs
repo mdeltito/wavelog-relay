@@ -1,28 +1,17 @@
 //! Wavelog HTTP client.
 //!
-//! A single [`WavelogClient`] handles every Wavelog endpoint the bridge
-//! talks to:
+//! [`WavelogClient`] is stateless and [`Clone`] — safe to share
+//! between the poller, the WSJT-X worker, and the one-shot subcommand.
+//! Three endpoints:
 //!
 //! - [`push_radio`](WavelogClient::push_radio) — `POST /api/radio`,
-//!   used by the poller for live rig-state updates. **Stateless**: the
-//!   poller is responsible for any dedupe / heartbeat policy. Wavelog
-//!   accepts the radio POST when HTTP status is 2xx; body is ignored.
-//! - [`push_qso`](WavelogClient::push_qso) — `POST /api/qso`, used by
-//!   the WSJT-X listener to forward ADIF log entries. Wavelog signals
-//!   success via the JSON `status: "created"` field, so 2xx alone is
-//!   not enough; anything else surfaces as [`WavelogError::Rejected`].
+//!   used by the poller for live rig-state updates. Caller owns any
+//!   dedupe / heartbeat policy.
+//! - [`push_qso`](WavelogClient::push_qso) — `POST /api/qso`. Wavelog
+//!   signals success via JSON `status: "created"`; 2xx alone is not
+//!   enough (duplicates and validation errors return 200 too).
 //! - [`list_stations`](WavelogClient::list_stations) —
-//!   `GET /api/station_info/<key>`, used by the `stations` subcommand
-//!   for ID discovery.
-//!
-//! All POST methods share a single retry helper: `[0, 1, 4]` s sleeps
-//! before attempts 1, 2, 3 on transport errors / 5xx; 4xx and
-//! `Rejected` are non-retryable.
-//!
-//! The client owns nothing per-call: it's [`Clone`] (the inner
-//! `reqwest::Client` is internally `Arc`-shared) and safe to share
-//! between the poller, the WSJT-X worker, and the one-shot
-//! subcommand.
+//!   `GET /api/station_info/<key>`, used by the `stations` subcommand.
 
 use std::fmt;
 use std::future::Future;
@@ -93,10 +82,8 @@ pub enum WavelogError {
     #[error("wavelog returned HTTP {status}: {body}")]
     Status { status: u16, body: Box<str> },
 
-    /// Wavelog returned an HTTP 2xx but the JSON body's `status` field
-    /// was something other than `"created"` — duplicate QSO, validation
-    /// failure, etc. Not retryable: the transport succeeded; only the
-    /// logical operation failed.
+    /// 2xx with JSON `status` other than `"created"`. Not retryable:
+    /// transport succeeded; only the logical operation failed.
     #[error("wavelog rejected the submission: {reason}")]
     Rejected { reason: Box<str> },
 
@@ -128,10 +115,9 @@ impl WavelogClient {
         })
     }
 
-    /// POST a radio-state snapshot to `/api/radio`. Returns `Ok(())`
-    /// on a successful 2xx; non-2xx surfaces as
-    /// [`WavelogError::Status`]. Stateless — dedupe / heartbeat is the
-    /// caller's responsibility.
+    /// POST a radio-state snapshot to `/api/radio`. `power` is omitted
+    /// when [`RigState::power`] is `None` so rigs without RFPOWER
+    /// readback don't log fake wattage.
     pub async fn push_radio(
         &self,
         radio: &str,
@@ -144,7 +130,7 @@ impl WavelogClient {
             radio,
             frequency: state.freq,
             mode: &state.mode,
-            power: state.power * power_max_watts,
+            power: state.power.map(|p| p * power_max_watts),
         };
         with_retries("push_radio", || async {
             self.do_radio_post(&url, &payload).await
@@ -278,8 +264,6 @@ fn build_url(base_url: &str, suffix: &str) -> Result<Url, WavelogError> {
 
 fn build_station_info_url(base_url: &str, key: &str) -> Result<Url, WavelogError> {
     let mut url = build_url(base_url, "station_info")?;
-    // path_segments_mut handles percent-encoding for keys that may
-    // contain characters outside the URL-safe set.
     url.path_segments_mut()
         .map_err(|_| WavelogError::InvalidUrl(base_url.into()))?
         .push(key);
@@ -292,7 +276,8 @@ struct RadioPayload<'a> {
     radio: &'a str,
     frequency: u64,
     mode: &'a str,
-    power: f32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    power: Option<f32>,
 }
 
 #[derive(Serialize)]
@@ -349,7 +334,15 @@ mod tests {
         RigState {
             freq,
             mode: mode.into(),
-            power,
+            power: Some(power),
+        }
+    }
+
+    fn rig_state_no_power(freq: u64, mode: &str) -> RigState {
+        RigState {
+            freq,
+            mode: mode.into(),
+            power: None,
         }
     }
 
@@ -461,6 +454,26 @@ mod tests {
         assert!(body.get("frequency_rx").is_none());
         assert!(body.get("mode_rx").is_none());
         assert!(body.get("timestamp").is_none());
+    }
+
+    #[tokio::test]
+    async fn push_radio_omits_power_field_when_state_power_is_none() {
+        let server = radio_server_with_response(ResponseTemplate::new(200)).await;
+        let client = client_for(&server);
+        client
+            .push_radio("FT-710", &rig_state_no_power(14_074_000, "USB"), 100.0)
+            .await
+            .unwrap();
+
+        let body: Value =
+            serde_json::from_slice(&server.received_requests().await.unwrap()[0].body).unwrap();
+        assert!(
+            body.get("power").is_none(),
+            "power must be omitted when None: {body}",
+        );
+        // Other required fields still present.
+        assert_eq!(body["frequency"], 14_074_000);
+        assert_eq!(body["mode"], "USB");
     }
 
     #[tokio::test]

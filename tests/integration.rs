@@ -220,7 +220,12 @@ async fn full_round_trip_outbound_and_inbound() {
     assert_eq!(radio_status_body["frequency"], 14_000_000);
     assert_eq!(radio_status_body["mode"], "USB");
     assert!((radio_status_body["power"].as_f64().unwrap() - 10.0).abs() < 1e-3);
-    assert!(radio_status_body["timestamp"].as_str().is_some());
+    // Wavelog's cat.js does `Date.now() - data.timestamp`, so the
+    // wire contract is epoch milliseconds, not an RFC3339 string.
+    let ts = radio_status_body["timestamp"]
+        .as_u64()
+        .expect("timestamp must be epoch ms (u64)");
+    assert!(ts >= 1_577_836_800_000, "timestamp {ts} too small");
 
     // --- shutdown ---
     let _ = shutdown_tx.send(true);

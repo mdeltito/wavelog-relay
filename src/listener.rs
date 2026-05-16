@@ -7,17 +7,26 @@
 //! [`ModeOverrides`], and dispatch `F`/`M` commands through the
 //! cloned [`RigHandle`].
 //!
-//! CORS is required (the browser issues this as a `cors`-mode `fetch`
-//! and reads the response body); we allow exactly one origin — the
-//! configured Wavelog base URL's origin — and rely on tower-http's
-//! default `Vary: Origin`.
+//! Two-layer origin enforcement:
+//!
+//! - **CORS layer** advertises `Access-Control-Allow-Origin` only when
+//!   the request's `Origin` matches the configured Wavelog URL. This is
+//!   what makes Wavelog's frontend able to read the response body.
+//! - **Handler-level Origin check** rejects mismatched-origin requests
+//!   with 403 *before* dispatching the rig command. CORS by itself
+//!   doesn't block the side effect — browsers send the cross-origin
+//!   `fetch` and only refuse JS access to the response, so a malicious
+//!   page would still retune the rig. Browsers always include `Origin`
+//!   on cross-origin GETs, so requiring it when present closes every
+//!   browser-CSRF path. Requests with no `Origin` (curl, scripts on the
+//!   host) are still allowed — local tooling is inherently trusted.
 
 use std::io;
 
 use axum::Router;
 use axum::body::Body;
 use axum::extract::{Path, State};
-use axum::http::{HeaderValue, Method, StatusCode};
+use axum::http::{HeaderMap, HeaderValue, Method, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use thiserror::Error;
@@ -58,7 +67,11 @@ pub async fn serve(
 }
 
 fn build_router(rig: RigHandle, allow_origin: HeaderValue, overrides: ModeOverrides) -> Router {
-    let state = AppState { rig, overrides };
+    let state = AppState {
+        rig,
+        overrides,
+        allow_origin: allow_origin.clone(),
+    };
     // Predicate (not `AllowOrigin::exact`) so the listener only
     // advertises Access-Control-Allow-Origin when the request actually
     // came from the configured origin — `exact` would echo the
@@ -83,12 +96,26 @@ fn build_router(rig: RigHandle, allow_origin: HeaderValue, overrides: ModeOverri
 struct AppState {
     rig: RigHandle,
     overrides: ModeOverrides,
+    allow_origin: HeaderValue,
 }
 
 async fn tune(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Path((freq_segment, mode_segment)): Path<(String, String)>,
 ) -> Response {
+    // CSRF guard: any request that carries an Origin header must match
+    // the configured Wavelog origin. Requests with no Origin (curl from
+    // the host, scripts) are allowed through — browsers always set
+    // Origin on cross-origin fetch, so this rejects every malicious-
+    // page path while preserving local tooling.
+    if let Some(origin) = headers.get(header::ORIGIN)
+        && origin != state.allow_origin
+    {
+        tracing::warn!(?origin, "click-to-tune: rejecting mismatched origin");
+        return StatusCode::FORBIDDEN.into_response();
+    }
+
     let Ok(freq) = freq_segment.parse::<u64>() else {
         tracing::debug!(freq = %freq_segment, "click-to-tune: bad freq");
         return StatusCode::BAD_REQUEST.into_response();
@@ -275,7 +302,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn non_matching_origin_gets_no_cors_header() {
+    async fn non_matching_origin_returns_403_and_does_not_tune() {
+        // CORS alone doesn't block the side effect — a malicious page
+        // can still trigger a fetch and the rig moves. The handler-
+        // level Origin check is what closes that path.
         let mock = spawn_recording_rigctld().await;
         let (rig, _join) = rigctld::spawn(mock.addr, Duration::from_secs(3));
         let app = build_router(rig, wavelog_origin(), ModeOverrides::default());
@@ -287,16 +317,11 @@ mod tests {
             ))
             .await
             .unwrap();
-        // The request still succeeds at the HTTP layer — CORS is
-        // enforced browser-side via the absence of the allow-origin
-        // header. We assert that absence.
-        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
         assert!(
-            response
-                .headers()
-                .get(header::ACCESS_CONTROL_ALLOW_ORIGIN)
-                .is_none(),
-            "expected no allow-origin header for non-matching origin",
+            mock.commands().is_empty(),
+            "rig must not have been touched: {:?}",
+            mock.commands(),
         );
     }
 

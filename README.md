@@ -98,6 +98,8 @@ dig = "PKTLSB"
 
 rigctld reports RFPOWER as a fraction `0.0..=1.0`. wavelog-bridge multiplies by `--power-max` to produce watts for the Wavelog payload. **Set `--power-max` to your rig's actual maximum** — otherwise your QSO logs will record a silently-wrong wattage. Going through hamlib's `\power2mW` (which would let the rig itself convert) is out of scope for v1.
 
+If your rig or hamlib backend doesn't expose RFPOWER readback (some older rigs return `RPRT -11`), the `power` field is omitted from both the `/api/radio` POST and the WebSocket `radio_status` frame — the rig card still updates with frequency and mode. RFPOWER reports the user-set TX level, not delivered TX power; switching to `RFPOWER_METER` (which only meters during transmit and isn't supported by every backend) is a deferred v3 concern.
+
 ## Mode mapping
 
 Wavelog sends the mode as a lowercase URL path segment; we translate to hamlib's uppercase names:

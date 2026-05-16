@@ -28,7 +28,7 @@
 
 use std::io;
 use std::sync::Arc;
-use std::time::SystemTime;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::Router;
 use axum::extract::State;
@@ -89,8 +89,8 @@ impl WsBandmapHandle {
             radio: &self.inner.radio,
             frequency: state.freq,
             mode: &state.mode,
-            power: state.power * self.inner.power_max_watts,
-            timestamp: Iso8601(SystemTime::now()),
+            power: state.power.map(|p| p * self.inner.power_max_watts),
+            timestamp: epoch_millis(),
         };
         let json = match serde_json::to_string(&frame) {
             Ok(s) => s,
@@ -104,7 +104,10 @@ impl WsBandmapHandle {
         let _ = self.inner.tx.send(Arc::from(json));
     }
 
-    fn subscribe(&self) -> broadcast::Receiver<Arc<str>> {
+    /// Subscribe to the broadcast stream of `radio_status` frames.
+    /// `pub(crate)` so the poller's integration tests can count
+    /// frames; not part of the public crate API.
+    pub(crate) fn subscribe(&self) -> broadcast::Receiver<Arc<str>> {
         self.inner.tx.subscribe()
     }
 }
@@ -116,20 +119,23 @@ struct RadioStatus<'a> {
     radio: &'a str,
     frequency: u64,
     mode: &'a str,
-    power: f32,
-    timestamp: Iso8601,
+    /// Watts (post `--power-max` scaling). Omitted when the rig
+    /// backend doesn't expose RFPOWER readback so the rig card shows
+    /// freq/mode without a fake wattage.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    power: Option<f32>,
+    /// Unix epoch milliseconds. Wavelog's `cat.js` consumes this with
+    /// `Date.now() - data.timestamp` to drive the rig card's staleness
+    /// indicator — anything other than a numeric epoch-ms produces NaN
+    /// and the staleness state never fires.
+    timestamp: u64,
 }
 
-// Wrap SystemTime so we can serialize via humantime's Rfc3339 formatter
-// without pulling in chrono. The frontend's "updated N minutes ago"
-// display reads the `timestamp` field — exact precision doesn't matter,
-// whole-seconds is plenty.
-struct Iso8601(SystemTime);
-
-impl Serialize for Iso8601 {
-    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
-        s.collect_str(&humantime::format_rfc3339_seconds(self.0))
-    }
+fn epoch_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 /// Run the WebSocket bandmap server on a pre-bound TCP listener until
@@ -306,7 +312,15 @@ mod tests {
         RigState {
             freq: 14_074_000,
             mode: "USB".into(),
-            power: 0.1,
+            power: Some(0.1),
+        }
+    }
+
+    fn dummy_state_no_power() -> RigState {
+        RigState {
+            freq: 14_074_000,
+            mode: "USB".into(),
+            power: None,
         }
     }
 
@@ -423,10 +437,12 @@ mod tests {
         assert_eq!(parsed["frequency"], 14_074_000);
         assert_eq!(parsed["mode"], "USB");
         assert!((parsed["power"].as_f64().unwrap() - 10.0).abs() < 1e-3);
-        assert!(
-            parsed["timestamp"].as_str().is_some(),
-            "missing timestamp in {parsed}"
-        );
+        let ts = parsed["timestamp"]
+            .as_u64()
+            .unwrap_or_else(|| panic!("timestamp not a u64 in {parsed}"));
+        // Sanity-check: epoch ms in 2020 onwards (>= 2020-01-01) and
+        // not a Unix-second value mistakenly serialized as ms.
+        assert!(ts >= 1_577_836_800_000, "timestamp {ts} too small");
 
         let _ = shutdown_tx.send(true);
         let _ = socket.close(None).await;
@@ -515,5 +531,36 @@ mod tests {
         let handle = WsBandmapHandle::new("FT-710".into(), 100.0);
         // No subscribers — must not panic, not error visibly.
         handle.broadcast(&dummy_state());
+    }
+
+    #[tokio::test]
+    async fn broadcast_omits_power_when_state_power_is_none() {
+        let handle = WsBandmapHandle::new("FT-710".into(), 100.0);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let (addr, _join) = spawn_server(handle.clone(), shutdown_rx).await;
+
+        let req = ws_request(addr, "https://wavelog.test");
+        let (mut socket, _resp) = tokio_tungstenite::connect_async(req).await.unwrap();
+        let _welcome = socket.next().await.unwrap().unwrap();
+
+        handle.broadcast(&dummy_state_no_power());
+        let msg = tokio::time::timeout(Duration::from_secs(2), socket.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        let body = match msg {
+            TungMessage::Text(s) => s,
+            other => panic!("unexpected: {other:?}"),
+        };
+        let parsed: serde_json::Value = serde_json::from_str(body.as_str()).unwrap();
+        assert_eq!(parsed["type"], "radio_status");
+        assert!(
+            parsed.get("power").is_none(),
+            "power must be omitted when None: {parsed}",
+        );
+
+        let _ = shutdown_tx.send(true);
+        let _ = socket.close(None).await;
     }
 }

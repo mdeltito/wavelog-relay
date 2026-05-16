@@ -1,18 +1,25 @@
 //! Periodic poll → push loop.
 //!
-//! Each tick reads a [`RigState`] via [`RigHandle::poll`] and forwards
-//! it to both the WS bandmap (every tick, no dedupe) and Wavelog's
-//! `/api/radio` endpoint (dedupe + heartbeat + retry policy applied).
-//! The asymmetry is deliberate: WS frames are cheap and the bandmap UI
-//! wants live updates while the VFO turns; the HTTP dedupe exists to
-//! spare Wavelog DB writes.
+//! Two cooperating tasks coordinated by a `watch::channel`:
 //!
-//! Dedupe state lives **here**, not on [`WavelogClient`]. That's the
-//! point: dedupe is a poller strategy (quantize, compare, skip,
-//! heartbeat every 30 s) — it's not a property of the HTTP client.
-//! Keeping it in this module lets the client stay stateless and
-//! shareable between the poller, the WSJT-X listener, and the
-//! `stations` subcommand.
+//! - **Tick loop** (`run`): reads a [`RigState`] via [`RigHandle::poll`]
+//!   each tick, hands it to [`WsBandmapHandle::broadcast`] synchronously
+//!   (cheap, fan-out is local), and publishes it on the watch channel.
+//!   The tick loop never awaits a network POST.
+//! - **Radio worker** ([`radio_worker`]): observes `changed()` on the
+//!   watch channel, runs the deduper, and POSTs to `/api/radio` with the
+//!   shared retry policy. The watch's latest-only semantics drop
+//!   intermediate samples while a slow POST is in flight — exactly
+//!   right for the "WS bandmap stays live; HTTP can lag" asymmetry.
+//!
+//! Splitting the two means a multi-second Wavelog stall (5s timeout × 3
+//! retries on outage) doesn't starve the WS bandmap or block shutdown
+//! observation.
+//!
+//! Dedupe state lives in the worker, not on [`WavelogClient`] — dedupe
+//! is a poller strategy (quantize, compare, skip, heartbeat every 30 s),
+//! not a property of the HTTP client. Keeping it here lets one client
+//! serve both the poller and the WSJT-X listener.
 //!
 //! Per-tick errors are logged at WARN and the loop continues — only a
 //! shutdown signal exits.
@@ -33,6 +40,10 @@ const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
 /// Run the poll → push loop until `shutdown` resolves to `true` or the
 /// watch sender is dropped. Per-tick errors are logged and skipped.
 ///
+/// Spawns one background worker task for the wavelog POST path; this
+/// function owns the tick loop. Returns once shutdown is observed and
+/// the worker has joined.
+///
 /// The `radio` name and `power_max_watts` are baked in here because
 /// they're constants for the bridge's lifetime; pulling them out of
 /// the client lets a single `WavelogClient` serve both this poller
@@ -46,61 +57,115 @@ pub async fn run(
     tick_interval: Duration,
     mut shutdown: watch::Receiver<bool>,
 ) {
-    // Mark the current value as seen so `changed()` only fires on
-    // subsequent updates. If the sender already flipped to `true`
-    // before we got here, exit straight away.
     if *shutdown.borrow_and_update() {
         return;
     }
 
-    let mut deduper = Deduper::default();
+    // None means "no snapshot yet"; the worker treats this as a no-op.
+    // Watch's "latest only" semantics intentionally drop intermediate
+    // states while a slow POST is in flight.
+    let (state_tx, state_rx) = watch::channel::<Option<RigState>>(None);
+    let worker = tokio::spawn(radio_worker(
+        state_rx,
+        client,
+        radio,
+        power_max_watts,
+        shutdown.clone(),
+    ));
+
     let mut ticker = interval(tick_interval);
     ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
     tracing::info!(?tick_interval, "poller started");
     loop {
         tokio::select! {
             _ = ticker.tick() => {
-                tick(&rig, &client, &radio, power_max_watts, &mut deduper, &ws_bandmap).await;
-            },
+                match rig.poll().await {
+                    Ok(state) => {
+                        ws_bandmap.broadcast(&state);
+                        // send only errors when every receiver has been
+                        // dropped, which only happens after this loop
+                        // exits and the worker join completes.
+                        let _ = state_tx.send(Some(state));
+                    }
+                    Err(e) => tracing::warn!(error = %e, "rig poll failed"),
+                }
+            }
             result = shutdown.changed() => {
                 let should_stop = result.is_err() || *shutdown.borrow();
                 if should_stop {
                     tracing::info!("poller shutting down");
-                    return;
+                    break;
                 }
             }
         }
     }
+
+    // Drop the state sender so the worker's `changed()` returns Err
+    // and it exits cleanly even if shutdown didn't fire (e.g. tests
+    // that drop the watch sender to terminate).
+    drop(state_tx);
+    if let Err(e) = worker.await {
+        tracing::warn!(error = %e, "radio worker task did not exit cleanly");
+    }
 }
 
-async fn tick(
-    rig: &RigHandle,
-    client: &WavelogClient,
-    radio: &str,
+/// Drain the `watch` of latest [`RigState`] snapshots, run the deduper,
+/// and POST to Wavelog. Cancellation-aware: if `shutdown` flips during
+/// an in-flight POST, the task returns without waiting for the retry
+/// schedule (`[0,1,4]s` × 5s timeout) to exhaust.
+async fn radio_worker(
+    mut state_rx: watch::Receiver<Option<RigState>>,
+    client: WavelogClient,
+    radio: Box<str>,
     power_max_watts: f32,
-    deduper: &mut Deduper,
-    ws_bandmap: &WsBandmapHandle,
+    mut shutdown: watch::Receiver<bool>,
 ) {
-    let state = match rig.poll().await {
-        Ok(s) => s,
-        Err(e) => {
-            tracing::warn!(error = %e, "rig poll failed");
-            return;
-        },
-    };
-    // Broadcast before the wavelog POST — the POST awaits a network
-    // round-trip, but WS subscribers should see fresh state on every
-    // tick regardless of whether wavelog is reachable.
-    ws_bandmap.broadcast(&state);
-
-    let now = Instant::now();
-    if deduper.should_skip(&state, now) {
-        tracing::debug!(freq = state.freq, mode = %state.mode, "wavelog push deduped");
+    if *shutdown.borrow_and_update() {
         return;
     }
-    match client.push_radio(radio, &state, power_max_watts).await {
-        Ok(()) => deduper.record(&state, now),
-        Err(e) => log_push_failure(&e),
+    let mut deduper = Deduper::default();
+    loop {
+        tokio::select! {
+            res = state_rx.changed() => {
+                if res.is_err() {
+                    tracing::info!("radio worker: state channel closed");
+                    return;
+                }
+                let snapshot = state_rx.borrow_and_update().clone();
+                let Some(state) = snapshot else { continue };
+                let now = Instant::now();
+                if deduper.should_skip(&state, now) {
+                    tracing::debug!(
+                        freq = state.freq,
+                        mode = %state.mode,
+                        "wavelog push deduped",
+                    );
+                    continue;
+                }
+                tokio::select! {
+                    push_res = client.push_radio(&radio, &state, power_max_watts) => {
+                        match push_res {
+                            Ok(()) => deduper.record(&state, now),
+                            Err(e) => log_push_failure(&e),
+                        }
+                    }
+                    res = shutdown.changed() => {
+                        let should_stop = res.is_err() || *shutdown.borrow();
+                        if should_stop {
+                            tracing::info!("radio worker shutting down (mid-push)");
+                            return;
+                        }
+                    }
+                }
+            }
+            result = shutdown.changed() => {
+                let should_stop = result.is_err() || *shutdown.borrow();
+                if should_stop {
+                    tracing::info!("radio worker shutting down");
+                    return;
+                }
+            }
+        }
     }
 }
 
@@ -123,7 +188,10 @@ struct Deduper {
 struct DedupeKey {
     freq: u64,
     mode: Box<str>,
-    rfpower_q: i32,
+    /// `None` when the rig backend doesn't expose RFPOWER. Compared as
+    /// part of the key so a rig that suddenly starts/stops reporting
+    /// power crosses the dedupe boundary and re-pushes.
+    rfpower_q: Option<i32>,
 }
 
 impl Deduper {
@@ -133,7 +201,7 @@ impl Deduper {
         };
         last.freq == state.freq
             && *last.mode == *state.mode
-            && last.rfpower_q == quantize_rfpower(state.power)
+            && last.rfpower_q == state.power.map(quantize_rfpower)
             && now.duration_since(last_at) < HEARTBEAT_INTERVAL
     }
 
@@ -141,7 +209,7 @@ impl Deduper {
         self.last = Some(DedupeKey {
             freq: state.freq,
             mode: state.mode.clone(),
-            rfpower_q: quantize_rfpower(state.power),
+            rfpower_q: state.power.map(quantize_rfpower),
         });
         self.last_at = Some(now);
     }
@@ -231,7 +299,15 @@ mod tests {
         RigState {
             freq,
             mode: mode.into(),
-            power,
+            power: Some(power),
+        }
+    }
+
+    fn rig_state_no_power(freq: u64, mode: &str) -> RigState {
+        RigState {
+            freq,
+            mode: mode.into(),
+            power: None,
         }
     }
 
@@ -304,6 +380,27 @@ mod tests {
         // 0.100 -> bin 20, 0.101 -> 20.2 -> bin 20: same bin, dedupes.
         deduper.record(&rig_state(14_074_000, "USB", 0.100), now);
         assert!(deduper.should_skip(&rig_state(14_074_000, "USB", 0.101), now));
+    }
+
+    #[test]
+    fn deduper_treats_none_power_as_distinct_from_some() {
+        // A rig that flips between reporting power and not (e.g. a
+        // hamlib backend with intermittent RFPOWER support) should
+        // not silently dedupe the transition.
+        let now = Instant::now();
+        let mut deduper = Deduper::default();
+        deduper.record(&rig_state(14_074_000, "USB", 0.10), now);
+        assert!(!deduper.should_skip(&rig_state_no_power(14_074_000, "USB"), now));
+    }
+
+    #[test]
+    fn deduper_skips_repeated_none_power() {
+        // Steady-state on a RFPOWER-less rig: still want dedupe.
+        let now = Instant::now();
+        let mut deduper = Deduper::default();
+        let state = rig_state_no_power(14_074_000, "USB");
+        deduper.record(&state, now);
+        assert!(deduper.should_skip(&state, now + Duration::from_secs(10)));
     }
 
     #[test]
@@ -515,5 +612,120 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn ws_broadcast_keeps_running_during_slow_wavelog_post() {
+        // The whole point of the off-tick worker: a multi-second
+        // /api/radio stall must not freeze the WS bandmap. We assert
+        // that the rig is polled (and therefore the WS handle's
+        // broadcast is invoked) repeatedly while the wavelog mock
+        // holds every POST for several seconds.
+        let rig_addr = spawn_persistent_rigctld().await;
+        let (rig, _rig_join) = rigctld::spawn(rig_addr, Duration::from_secs(3));
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/radio"))
+            .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_secs(3)))
+            .mount(&server)
+            .await;
+        let client = WavelogClient::new(&server.uri(), "test-key").unwrap();
+
+        let counter_handle = CountingWsHandle::new();
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let poller = tokio::spawn(run(
+            rig,
+            client,
+            "FT-710".into(),
+            100.0,
+            counter_handle.bandmap_handle(),
+            Duration::from_millis(50),
+            shutdown_rx,
+        ));
+
+        // Run for ~750ms — well under the 3s POST stall but long
+        // enough to expect ~15 ticks. A pre-refactor poller would
+        // have produced exactly one broadcast (then blocked on the
+        // POST); the worker split lets the tick loop keep polling.
+        tokio::time::sleep(Duration::from_millis(750)).await;
+        let observed = counter_handle.count();
+        assert!(
+            observed >= 5,
+            "expected ws broadcasts to keep firing during slow POST; got {observed}",
+        );
+
+        let _ = shutdown_tx.send(true);
+        let _ = tokio::time::timeout(Duration::from_secs(2), poller).await;
+    }
+
+    #[tokio::test]
+    async fn shutdown_during_inflight_post_returns_promptly() {
+        // Wavelog mock sleeps forever on POST. With cancellation-aware
+        // shutdown the whole poller (tick loop + worker) must exit
+        // well before the 5s reqwest timeout × 3 retries.
+        let rig_addr = spawn_persistent_rigctld().await;
+        let (rig, _rig_join) = rigctld::spawn(rig_addr, Duration::from_secs(3));
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/radio"))
+            .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_secs(60)))
+            .mount(&server)
+            .await;
+        let client = WavelogClient::new(&server.uri(), "test-key").unwrap();
+
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let poller = tokio::spawn(run(
+            rig,
+            client,
+            "FT-710".into(),
+            100.0,
+            dummy_ws_handle(),
+            Duration::from_millis(50),
+            shutdown_rx,
+        ));
+
+        // Let one POST get into flight.
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        let _ = shutdown_tx.send(true);
+        tokio::time::timeout(Duration::from_secs(1), poller)
+            .await
+            .expect("poller did not exit within 1s of shutdown")
+            .expect("poller task panicked");
+    }
+
+    /// WS handle wrapper that counts how many `broadcast` calls land —
+    /// used to assert the tick loop keeps polling while the worker
+    /// holds an in-flight POST.
+    struct CountingWsHandle {
+        count: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        handle: WsBandmapHandle,
+    }
+
+    impl CountingWsHandle {
+        fn new() -> Self {
+            // Real handle wraps a broadcast channel; subscribing here
+            // means the channel actually serializes a frame per send,
+            // and the count is observed when we drain.
+            let handle = WsBandmapHandle::new("FT-710".into(), 100.0);
+            let count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let mut rx = handle.subscribe();
+            let counter = std::sync::Arc::clone(&count);
+            tokio::spawn(async move {
+                while rx.recv().await.is_ok() {
+                    counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                }
+            });
+            Self { count, handle }
+        }
+
+        fn bandmap_handle(&self) -> WsBandmapHandle {
+            self.handle.clone()
+        }
+
+        fn count(&self) -> usize {
+            self.count.load(std::sync::atomic::Ordering::SeqCst)
+        }
     }
 }

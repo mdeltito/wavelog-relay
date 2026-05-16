@@ -197,9 +197,23 @@ async fn post_loop(
         tokio::select! {
             adif = rx.recv() => match adif {
                 Some(adif) => {
-                    match client.push_qso(&station_id, &adif).await {
-                        Ok(()) => tracing::info!("wsjtx QSO logged to wavelog"),
-                        Err(e) => tracing::warn!(error = %e, "wsjtx QSO POST failed"),
+                    // Inner select makes the in-flight POST cancellable.
+                    // Without it, a Wavelog outage holds the shutdown
+                    // signal for up to ~15s ([0,1,4]s sleeps × 5s
+                    // timeout) — longer than systemd's default
+                    // TimeoutStopSec patience.
+                    tokio::select! {
+                        push_res = client.push_qso(&station_id, &adif) => match push_res {
+                            Ok(()) => tracing::info!("wsjtx QSO logged to wavelog"),
+                            Err(e) => tracing::warn!(error = %e, "wsjtx QSO POST failed"),
+                        },
+                        result = shutdown.changed() => {
+                            let should_stop = result.is_err() || *shutdown.borrow();
+                            if should_stop {
+                                tracing::info!("wsjtx POST worker shutting down (mid-push)");
+                                return;
+                            }
+                        }
                     }
                 }
                 None => return,
@@ -552,6 +566,48 @@ mod tests {
         tokio::time::timeout(Duration::from_millis(500), worker_task)
             .await
             .expect("worker didn't exit within 500ms")
+            .expect("worker panicked");
+    }
+
+    #[tokio::test]
+    async fn shutdown_during_inflight_qso_post_returns_promptly() {
+        // Wavelog mock holds every POST for 60s. Without cancellation-
+        // aware shutdown the worker would block for the full 5s
+        // timeout × 3 retries. Tight the assert to 1s to lock that in.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/qso"))
+            .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_secs(60)))
+            .mount(&server)
+            .await;
+
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let listen_addr = socket.local_addr().unwrap();
+        let client = WavelogClient::new(&server.uri(), "test-key").unwrap();
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let (listener_task, worker_task) = spawn(socket, client, "1".into(), shutdown_rx);
+
+        // Push one ADIF in to start a POST.
+        let sender = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        sender
+            .send_to(
+                &encode_logged_adif("WSJT-X", "<CALL:5>VK3AB <EOR>"),
+                listen_addr,
+            )
+            .await
+            .unwrap();
+
+        // Give the worker time to pick up the ADIF and start the POST.
+        tokio::time::sleep(Duration::from_millis(150)).await;
+
+        shutdown_tx.send(true).unwrap();
+        tokio::time::timeout(Duration::from_secs(1), listener_task)
+            .await
+            .expect("listener did not exit within 1s of shutdown")
+            .expect("listener panicked");
+        tokio::time::timeout(Duration::from_secs(1), worker_task)
+            .await
+            .expect("worker did not exit within 1s of shutdown (in-flight POST not cancelled)")
             .expect("worker panicked");
     }
 }

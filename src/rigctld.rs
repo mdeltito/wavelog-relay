@@ -140,8 +140,11 @@ pub struct RigState {
     /// server-side.
     pub mode: Box<str>,
     /// Raw RFPOWER fraction, `0.0..=1.0`. Convert to watts by
-    /// multiplying by the rig's max RF power.
-    pub power: f32,
+    /// multiplying by the rig's max RF power. `None` when the rig
+    /// backend doesn't expose RFPOWER readback (`RPRT -11` etc.) —
+    /// the consumer should omit the field rather than substitute a
+    /// fake value.
+    pub power: Option<f32>,
 }
 
 #[derive(Debug, Error, Clone)]
@@ -188,15 +191,19 @@ impl RigHandle {
             .await
     }
 
-    /// Read freq, mode and RFPOWER as a single state snapshot. Three
-    /// sequential round trips through the actor; the actor processes
-    /// commands one at a time, so the reads are interleaved with
-    /// nothing else on this connection.
+    /// Read freq, mode and RFPOWER as a single atomic snapshot.
+    ///
+    /// All three reads happen inside one actor command dispatch — no
+    /// other queued command (notably a click-to-tune `set_freq_mode`)
+    /// can land between them, so the resulting [`RigState`] is always
+    /// internally consistent.
+    ///
+    /// RFPOWER is treated specially: backends that don't support
+    /// `\get_level RFPOWER` (returning `RPRT -11` or similar) yield
+    /// `power = None` rather than failing the whole snapshot. Other
+    /// I/O errors propagate.
     pub async fn poll(&self) -> Result<RigState, RigError> {
-        let freq = self.get_freq().await?;
-        let mode = self.get_mode().await?;
-        let power = self.get_power().await?;
-        Ok(RigState { freq, mode, power })
+        self.request(RigCommand::Poll).await
     }
 
     async fn request<T, F>(&self, make: F) -> Result<T, RigError>
@@ -216,6 +223,7 @@ enum RigCommand {
     GetFreq(oneshot::Sender<Result<u64, RigError>>),
     GetMode(oneshot::Sender<Result<Box<str>, RigError>>),
     GetPower(oneshot::Sender<Result<f32, RigError>>),
+    Poll(oneshot::Sender<Result<RigState, RigError>>),
     SetFreq {
         hz: u64,
         reply: oneshot::Sender<Result<(), RigError>>,
@@ -325,6 +333,9 @@ fn fail_command(cmd: RigCommand, err: RigError) {
         RigCommand::GetPower(reply) => {
             let _ = reply.send(Err(err));
         },
+        RigCommand::Poll(reply) => {
+            let _ = reply.send(Err(err));
+        },
         RigCommand::SetFreq { reply, .. } => {
             let _ = reply.send(Err(err));
         },
@@ -342,6 +353,7 @@ async fn handle_command(conn: &mut Connection, cmd: RigCommand) -> io::Result<()
         RigCommand::GetFreq(reply) => dispatch(reply, exec_get_freq(conn)).await,
         RigCommand::GetMode(reply) => dispatch(reply, exec_get_mode(conn)).await,
         RigCommand::GetPower(reply) => dispatch(reply, exec_get_power(conn)).await,
+        RigCommand::Poll(reply) => dispatch(reply, exec_poll(conn)).await,
         RigCommand::SetFreq { hz, reply } => dispatch(reply, exec_set_freq(conn, hz)).await,
         RigCommand::SetMode { mode, reply } => dispatch(reply, exec_set_mode(conn, mode)).await,
         RigCommand::SetFreqMode { hz, mode, reply } => {
@@ -433,7 +445,17 @@ async fn exec_get_mode(conn: &mut Connection) -> io::Result<Result<Box<str>, Rig
     if let Some(code) = parse_rprt(line1) {
         return Ok(Err(RigError::Hamlib(code)));
     }
-    let mode: Box<str> = line1.split_whitespace().next().unwrap_or("").into();
+    let token = line1.split_whitespace().next().unwrap_or("");
+    if token.is_empty() {
+        // Empty mode line is a malformed reply — surfacing it as
+        // BadResponse beats letting "" leak into the wavelog payload.
+        // Owned snapshot so we can release the read buffer borrow and
+        // still drain the passband line that follows.
+        let snapshot: Box<str> = line1.into();
+        let _ = conn.read_line().await?;
+        return Ok(Err(RigError::BadResponse(snapshot)));
+    }
+    let mode: Box<str> = token.into();
     // Drain the passband line that follows on a successful response.
     conn.read_line().await?;
     Ok(Ok(mode))
@@ -445,9 +467,47 @@ async fn exec_get_power(conn: &mut Connection) -> io::Result<Result<f32, RigErro
     if let Some(code) = parse_rprt(line) {
         return Ok(Err(RigError::Hamlib(code)));
     }
-    Ok(line
-        .parse::<f32>()
-        .map_err(|_| RigError::BadResponse(line.into())))
+    let raw: f32 = match line.parse() {
+        Ok(v) => v,
+        Err(_) => return Ok(Err(RigError::BadResponse(line.into()))),
+    };
+    if !raw.is_finite() {
+        return Ok(Err(RigError::BadResponse(line.into())));
+    }
+    // Some hamlib backends overshoot the documented [0.0, 1.0] range
+    // by a hair due to internal scaling rounding (e.g. 1.001). Clamp
+    // rather than reject — the alternative is dropping every snapshot
+    // whenever the rig sits at full power.
+    let clamped = raw.clamp(0.0, 1.0);
+    if (raw - clamped).abs() > f32::EPSILON {
+        tracing::warn!(raw, clamped, "rigctld RFPOWER out of [0,1] range; clamping");
+    }
+    Ok(Ok(clamped))
+}
+
+/// Read freq → mode → RFPOWER inside a single actor dispatch. The
+/// `?`-on-`io::Result` cascade is what gives us atomicity: nothing else
+/// in the actor's `recv` loop runs until this future resolves.
+///
+/// RFPOWER is special: a backend that returns `RPRT -N` for the level
+/// query produces `power = None` (the rig simply doesn't report it),
+/// not a failed snapshot. Other paths (Disconnected, BadResponse) still
+/// surface to the caller.
+async fn exec_poll(conn: &mut Connection) -> io::Result<Result<RigState, RigError>> {
+    let freq = match exec_get_freq(conn).await? {
+        Ok(v) => v,
+        Err(e) => return Ok(Err(e)),
+    };
+    let mode = match exec_get_mode(conn).await? {
+        Ok(v) => v,
+        Err(e) => return Ok(Err(e)),
+    };
+    let power = match exec_get_power(conn).await? {
+        Ok(v) => Some(v),
+        Err(RigError::Hamlib(_)) => None,
+        Err(e) => return Ok(Err(e)),
+    };
+    Ok(Ok(RigState { freq, mode, power }))
 }
 
 async fn exec_set_freq(conn: &mut Connection, hz: u64) -> io::Result<Result<(), RigError>> {
@@ -745,6 +805,63 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn get_mode_rejects_empty_response_as_bad_response() {
+        let addr = spawn_mock(|mut conn| async move {
+            conn.expect("m").await;
+            // First line empty, second line is the (also-meaningless)
+            // passband — exec_get_mode must drain both to keep the
+            // connection in sync.
+            conn.reply("\n0").await;
+        })
+        .await;
+        let (handle, _join) = spawn(addr, TEST_TIMEOUT);
+        let err = handle.get_mode().await.unwrap_err();
+        assert!(matches!(err, RigError::BadResponse(_)), "got {err:?}");
+    }
+
+    #[tokio::test]
+    async fn get_power_rejects_non_finite_value() {
+        for reply in ["NaN", "inf", "-inf"] {
+            let r = reply;
+            let addr = spawn_mock(move |mut conn| async move {
+                conn.expect("\\get_level RFPOWER").await;
+                conn.reply(r).await;
+            })
+            .await;
+            let (handle, _join) = spawn(addr, TEST_TIMEOUT);
+            let err = handle.get_power().await.unwrap_err();
+            assert!(
+                matches!(err, RigError::BadResponse(_)),
+                "input {reply}: got {err:?}",
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn get_power_clamps_out_of_range_value() {
+        let addr = spawn_mock(|mut conn| async move {
+            conn.expect("\\get_level RFPOWER").await;
+            conn.reply("1.001").await;
+        })
+        .await;
+        let (handle, _join) = spawn(addr, TEST_TIMEOUT);
+        let p = handle.get_power().await.unwrap();
+        assert!((p - 1.0).abs() < 1e-6, "got {p}");
+    }
+
+    #[tokio::test]
+    async fn get_power_clamps_negative_value() {
+        let addr = spawn_mock(|mut conn| async move {
+            conn.expect("\\get_level RFPOWER").await;
+            conn.reply("-0.001").await;
+        })
+        .await;
+        let (handle, _join) = spawn(addr, TEST_TIMEOUT);
+        let p = handle.get_power().await.unwrap();
+        assert!(p == 0.0, "got {p}");
+    }
+
+    #[tokio::test]
     async fn unparseable_response_surfaces_as_bad_response() {
         let addr = spawn_mock(|mut conn| async move {
             conn.expect("f").await;
@@ -786,7 +903,59 @@ mod tests {
         let state = handle.poll().await.unwrap();
         assert_eq!(state.freq, 14_074_000);
         assert_eq!(&*state.mode, "USB");
-        assert!((state.power - 0.25).abs() < 1e-6);
+        let power = state.power.expect("power should be Some when rig replies");
+        assert!((power - 0.25).abs() < 1e-6);
+    }
+
+    #[tokio::test]
+    async fn poll_returns_none_power_when_rig_lacks_rfpower() {
+        // Rigs / hamlib backends without RFPOWER readback return
+        // `RPRT -11` (`RIG_ENAVAIL`). The whole snapshot must still
+        // succeed — power = None is the documented contract.
+        let addr = spawn_mock(|mut conn| async move {
+            conn.expect("f").await;
+            conn.reply("14074000").await;
+            conn.expect("m").await;
+            conn.reply("USB\n2400").await;
+            conn.expect("\\get_level RFPOWER").await;
+            conn.reply("RPRT -11").await;
+        })
+        .await;
+        let (handle, _join) = spawn(addr, TEST_TIMEOUT);
+        let state = handle.poll().await.unwrap();
+        assert_eq!(state.freq, 14_074_000);
+        assert_eq!(&*state.mode, "USB");
+        assert!(state.power.is_none(), "power should be None on RPRT -11");
+    }
+
+    #[tokio::test]
+    async fn poll_is_atomic_against_concurrent_get_freq() {
+        // While poll() is in flight, a racing get_freq queues. The
+        // mock asserts f → m → \get_level RFPOWER → f at the wire;
+        // if poll yielded back to the actor's recv loop between any
+        // two reads, the racing `f` would land in between and the
+        // mock would observe the wrong sequence.
+        let addr = spawn_mock(|mut conn| async move {
+            conn.expect("f").await;
+            // Brief pause so the racing get_freq has time to queue.
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            conn.reply("14074000").await;
+            conn.expect("m").await;
+            conn.reply("USB\n2400").await;
+            conn.expect("\\get_level RFPOWER").await;
+            conn.reply("0.10").await;
+            conn.expect("f").await;
+            conn.reply("14100000").await;
+        })
+        .await;
+        let (handle, _join) = spawn(addr, TEST_TIMEOUT);
+        let h2 = handle.clone();
+        let poll = tokio::spawn(async move { handle.poll().await });
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        let racing = tokio::spawn(async move { h2.get_freq().await });
+        let state = poll.await.unwrap().unwrap();
+        assert_eq!(state.freq, 14_074_000);
+        assert_eq!(racing.await.unwrap().unwrap(), 14_100_000);
     }
 
     #[tokio::test]
