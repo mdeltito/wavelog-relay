@@ -53,6 +53,7 @@ Every flag also reads `WAVELOG_BRIDGE_<UPPERCASE>` from the environment:
 | `--wsjtx` | _(off)_ | Enable the WSJT-X UDP listener for forwarding logged QSOs to Wavelog. Requires `--station-id` |
 | `--wsjtx-listen <ADDR>` | `127.0.0.1:2237` | WSJT-X UDP listener bind (honored only with `--wsjtx`). Must match WSJT-X's `Settings → Reporting → UDP Server` |
 | `--station-id <ID>` | _(required if `--wsjtx`)_ | Wavelog station profile ID for QSO submissions. Run `wavelog-bridge stations` to look up IDs |
+| `--qso-queue-path <PATH>` | `$XDG_STATE_HOME/wavelog-bridge/qso_queue.jsonl` | On-disk JSONL spool for WSJT-X QSOs awaiting Wavelog. Created if absent. See "Persistent QSO queue" below |
 | `--interval <DUR>` | `1s` | Humantime: `1s`, `500ms`, etc. |
 | `--rig-timeout <DUR>` | `3s` | Per-command read timeout against rigctld. On expiry the connection is dropped and the actor reconnects via backoff |
 | `--config <PATH>` | _(auto)_ | Optional TOML; auto-discovered at `$XDG_CONFIG_HOME/wavelog-bridge/config.toml` |
@@ -85,6 +86,7 @@ no_ws = false
 wsjtx = true
 wsjtx_listen = "127.0.0.1:2237"
 station_id = "1"
+qso_queue_path = "/var/lib/wavelog-bridge/qso_queue.jsonl"
 interval = "1s"
 rig_timeout = "3s"
 log_level = "info"
@@ -216,11 +218,18 @@ GridTracker2 supports listening on multicast too; check their docs to point it a
 
 **Note about WavelogGate**: WavelogGate listens on port `2333` for a *different* WSJT-X feed (the "N1MM Logger+" plaintext output, configured separately in WSJT-X's Reporting tab). If you've been running WavelogGate + GridTracker2 together, that's how — they're on different ports reading different feeds. wavelog-bridge uses the primary binary UDP feed (port 2237 by default), so the WavelogGate-on-2333 / GT2-on-2237 split doesn't apply.
 
+### Persistent QSO queue
+
+QSOs received from WSJT-X are spooled to `$XDG_STATE_HOME/wavelog-bridge/qso_queue.jsonl` (override with `--qso-queue-path`) **before** being handed to the POST worker. Entries are removed from the file only after Wavelog confirms the submission succeeded — or replies with a permanent `Rejected` (duplicate, validation failure). Transient errors (5xx, transport failures, malformed responses) leave the entry on disk; the next daemon start replays it.
+
+This means a Wavelog outage longer than the standard `[0, 1, 4]` s retry schedule no longer drops QSOs. Restart the daemon when Wavelog comes back and the spool empties on its own.
+
+The file is capped at 1000 entries; the oldest are evicted with a WARN if you somehow accumulate more (~5 hours of contest-rate FT8). If the file becomes corrupt — partial write from a power loss, manual hand-edit gone wrong — it's renamed to `<path>.corrupt-<unix-ms>` and the queue starts fresh; the corrupt copy is yours to inspect or recover. Running multiple `wavelog-bridge` instances against the same file is unsupported.
+
 ### Other limitations
 
 - Only `Logged ADIF` (type 12) is forwarded. The structured `QSO Logged` (type 5) message that precedes it is parsed and discarded to avoid double-logging.
-- No persistent retry queue. If Wavelog is unreachable longer than the standard `[0, 1, 4]` s retry schedule, the QSO is dropped with a `warn` log line. WavelogGate behaves the same way; if this matters for you, file an issue.
-- A bounded queue (32 entries) sits between the UDP listener and the POST worker; overflow is logged as `wsjtx POST queue full` and drops the newest datagram. In practice the queue holds ~30 s of contest-rate FT8 logs.
+- A bounded in-memory queue (32 entries) sits between the UDP listener and the POST worker; overflow is logged as `wsjtx POST queue full` and drops the newest datagram (the entry is still on disk if persistence is enabled). In practice the queue holds ~30 s of contest-rate FT8 logs.
 
 ## Browsers (Safari note)
 

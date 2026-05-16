@@ -26,13 +26,15 @@
 
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::sync::Arc;
 
 use thiserror::Error;
 use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 
-use crate::wavelog::WavelogClient;
+use crate::qso_queue::QsoQueue;
+use crate::wavelog::{WavelogClient, WavelogError};
 
 const MAGIC: u32 = 0xadbc_cbda;
 const MSG_TYPE_LOGGED_ADIF: u32 = 12;
@@ -104,10 +106,23 @@ fn bind_multicast(addr: SocketAddr) -> io::Result<UdpSocket> {
     Ok(tokio_socket)
 }
 
-/// Spawn the WSJT-X listener and POST worker. The listener reads from
-/// the pre-bound `socket`, parses Logged-ADIF messages, and pipes the
-/// ADIF text through a bounded queue to the worker, which submits each
-/// QSO via [`WavelogClient::push_qso`] with the given `station_id`.
+/// Spawn the WSJT-X listener and POST worker.
+///
+/// The listener reads from the pre-bound `socket`, parses
+/// Logged-ADIF messages, and pipes them through a bounded queue to
+/// the worker, which submits each QSO via
+/// [`WavelogClient::push_qso`] with the given `station_id`.
+///
+/// `queue` enables on-disk persistence: the listener appends every
+/// accepted ADIF to disk before queueing, and the worker removes the
+/// entry only after a successful POST or a permanent
+/// [`WavelogError::Rejected`] response. Pass `None` to run in pure
+/// in-memory mode (the v1 behaviour); transient outages drop QSOs
+/// after the standard `[0, 1, 4] s` retries exhaust.
+///
+/// `replay` is the set of entries already on disk at startup; they
+/// get pushed onto the worker queue ahead of any new arrivals. Pass
+/// an empty vec when persistence is disabled.
 ///
 /// Returns both task join handles. Both observe the shutdown watch
 /// channel and exit cleanly when it flips to `true` or its sender is
@@ -117,17 +132,46 @@ pub fn spawn(
     socket: UdpSocket,
     client: WavelogClient,
     station_id: Box<str>,
+    queue: Option<Arc<QsoQueue>>,
+    replay: Vec<(u64, Box<str>)>,
     shutdown: watch::Receiver<bool>,
 ) -> (JoinHandle<()>, JoinHandle<()>) {
-    let (tx, rx) = mpsc::channel::<Box<str>>(QUEUE_CAPACITY);
-    let listener = tokio::spawn(listen(socket, tx, shutdown.clone()));
-    let worker = tokio::spawn(post_loop(rx, client, station_id, shutdown));
+    let (tx, rx) = mpsc::channel::<QueueItem>(QUEUE_CAPACITY);
+
+    // Prime the worker channel with replay entries before the
+    // listener task starts pulling in new datagrams. blocking_send is
+    // wrong here — we're inside an async fn — but try_send is bounded
+    // by QUEUE_CAPACITY. If replay > capacity the surplus is dropped
+    // (unlikely in practice; cap is larger than typical replay).
+    for (seq, adif) in replay {
+        if let Err(e) = tx.try_send(QueueItem {
+            seq: Some(seq),
+            adif,
+        }) {
+            tracing::warn!(error = ?e, "wsjtx replay queue overflowed");
+            break;
+        }
+    }
+
+    let listener = tokio::spawn(listen(socket, tx, queue.clone(), shutdown.clone()));
+    let worker = tokio::spawn(post_loop(rx, client, station_id, queue, shutdown));
     (listener, worker)
+}
+
+#[derive(Debug)]
+struct QueueItem {
+    /// Sequence number from the on-disk queue, so the worker can call
+    /// `queue.remove(seq)` after a successful POST. `None` when
+    /// persistence is disabled or the entry came from a path that
+    /// didn't go through the queue.
+    seq: Option<u64>,
+    adif: Box<str>,
 }
 
 async fn listen(
     socket: UdpSocket,
-    tx: mpsc::Sender<Box<str>>,
+    tx: mpsc::Sender<QueueItem>,
+    queue: Option<Arc<QsoQueue>>,
     mut shutdown: watch::Receiver<bool>,
 ) {
     if let Ok(addr) = socket.local_addr() {
@@ -154,10 +198,32 @@ async fn listen(
                             adif_len = adif.len(),
                             "wsjtx logged ADIF received",
                         );
-                        match tx.try_send(adif) {
+                        let item = match &queue {
+                            Some(q) => {
+                                // Persist BEFORE handing off so a
+                                // crash between accept and POST
+                                // doesn't lose the QSO. Cloning the
+                                // ADIF is cheap (typically <1 KB).
+                                match q.append(adif.clone()).await {
+                                    Ok(seq) => QueueItem { seq: Some(seq), adif },
+                                    Err(e) => {
+                                        tracing::warn!(
+                                            error = %e,
+                                            from = %from,
+                                            "wsjtx queue append failed; dropping ADIF",
+                                        );
+                                        continue;
+                                    }
+                                }
+                            }
+                            None => QueueItem { seq: None, adif },
+                        };
+                        match tx.try_send(item) {
                             Ok(()) => {},
                             Err(mpsc::error::TrySendError::Full(_)) => {
-                                tracing::warn!("wsjtx POST queue full; dropping ADIF");
+                                tracing::warn!(
+                                    "wsjtx POST queue full; dropping ADIF (still on disk if persistence is on)",
+                                );
                             },
                             Err(mpsc::error::TrySendError::Closed(_)) => {
                                 tracing::warn!("wsjtx POST worker channel closed; exiting listener");
@@ -185,9 +251,10 @@ async fn listen(
 }
 
 async fn post_loop(
-    mut rx: mpsc::Receiver<Box<str>>,
+    mut rx: mpsc::Receiver<QueueItem>,
     client: WavelogClient,
     station_id: Box<str>,
+    queue: Option<Arc<QsoQueue>>,
     mut shutdown: watch::Receiver<bool>,
 ) {
     if *shutdown.borrow_and_update() {
@@ -195,17 +262,16 @@ async fn post_loop(
     }
     loop {
         tokio::select! {
-            adif = rx.recv() => match adif {
-                Some(adif) => {
+            item = rx.recv() => match item {
+                Some(item) => {
                     // Inner select makes the in-flight POST cancellable.
                     // Without it, a Wavelog outage holds the shutdown
                     // signal for up to ~15s ([0,1,4]s sleeps × 5s
                     // timeout) — longer than systemd's default
                     // TimeoutStopSec patience.
                     tokio::select! {
-                        push_res = client.push_qso(&station_id, &adif) => match push_res {
-                            Ok(()) => tracing::info!("wsjtx QSO logged to wavelog"),
-                            Err(e) => tracing::warn!(error = %e, "wsjtx QSO POST failed"),
+                        push_res = client.push_qso(&station_id, &item.adif) => {
+                            handle_post_outcome(push_res, item.seq, queue.as_deref()).await;
                         },
                         result = shutdown.changed() => {
                             let should_stop = result.is_err() || *shutdown.borrow();
@@ -226,6 +292,41 @@ async fn post_loop(
                 }
             }
         }
+    }
+}
+
+async fn handle_post_outcome(
+    res: Result<(), WavelogError>,
+    seq: Option<u64>,
+    queue: Option<&QsoQueue>,
+) {
+    match res {
+        Ok(()) => {
+            tracing::info!("wsjtx QSO logged to wavelog");
+            remove_persisted(seq, queue, "completed").await;
+        },
+        Err(WavelogError::Rejected { ref reason }) => {
+            // Wavelog answered cleanly with a permanent "no" (duplicate,
+            // validation error, etc). Retrying will produce the same
+            // answer; drop the entry from disk too.
+            tracing::warn!(reason = %reason, "wsjtx QSO rejected by wavelog");
+            remove_persisted(seq, queue, "rejected").await;
+        },
+        Err(e) => {
+            // Transport / 5xx / 4xx / BadResponse — keep on disk so
+            // the next startup (or a future outage-recovery pass)
+            // gets another shot.
+            tracing::warn!(error = %e, "wsjtx QSO POST failed; entry retained on disk for retry");
+        },
+    }
+}
+
+async fn remove_persisted(seq: Option<u64>, queue: Option<&QsoQueue>, why: &'static str) {
+    let (Some(seq), Some(queue)) = (seq, queue) else {
+        return;
+    };
+    if let Err(e) = queue.remove(seq).await {
+        tracing::warn!(error = %e, seq, why, "wsjtx queue remove failed");
     }
 }
 
@@ -429,7 +530,8 @@ mod tests {
         let listen_addr = socket.local_addr().unwrap();
         let client = WavelogClient::new(&server.uri(), "test-key").unwrap();
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
-        let (listener_task, worker_task) = spawn(socket, client, "7".into(), shutdown_rx);
+        let (listener_task, worker_task) =
+            spawn(socket, client, "7".into(), None, Vec::new(), shutdown_rx);
 
         // Send the WSJT-X packet from a separate socket.
         let sender = UdpSocket::bind("127.0.0.1:0").await.unwrap();
@@ -474,7 +576,8 @@ mod tests {
         let listen_addr = socket.local_addr().unwrap();
         let client = WavelogClient::new(&server.uri(), "test-key").unwrap();
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
-        let (listener_task, worker_task) = spawn(socket, client, "1".into(), shutdown_rx);
+        let (listener_task, worker_task) =
+            spawn(socket, client, "1".into(), None, Vec::new(), shutdown_rx);
 
         let sender = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         sender
@@ -556,7 +659,8 @@ mod tests {
         let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let client = WavelogClient::new(&server.uri(), "k").unwrap();
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
-        let (listener_task, worker_task) = spawn(socket, client, "1".into(), shutdown_rx);
+        let (listener_task, worker_task) =
+            spawn(socket, client, "1".into(), None, Vec::new(), shutdown_rx);
 
         shutdown_tx.send(true).unwrap();
         tokio::time::timeout(Duration::from_millis(500), listener_task)
@@ -585,7 +689,8 @@ mod tests {
         let listen_addr = socket.local_addr().unwrap();
         let client = WavelogClient::new(&server.uri(), "test-key").unwrap();
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
-        let (listener_task, worker_task) = spawn(socket, client, "1".into(), shutdown_rx);
+        let (listener_task, worker_task) =
+            spawn(socket, client, "1".into(), None, Vec::new(), shutdown_rx);
 
         // Push one ADIF in to start a POST.
         let sender = UdpSocket::bind("127.0.0.1:0").await.unwrap();
@@ -609,5 +714,190 @@ mod tests {
             .await
             .expect("worker did not exit within 1s of shutdown (in-flight POST not cancelled)")
             .expect("worker panicked");
+    }
+
+    #[tokio::test]
+    async fn persisted_adif_is_removed_from_disk_after_successful_post() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/qso"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "status": "created",
+            })))
+            .mount(&server)
+            .await;
+
+        let dir = tempfile::tempdir().unwrap();
+        let queue_path = dir.path().join("queue.jsonl");
+        let (queue, _replay) = QsoQueue::open(queue_path.clone()).await.unwrap();
+        let queue = std::sync::Arc::new(queue);
+
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let listen_addr = socket.local_addr().unwrap();
+        let client = WavelogClient::new(&server.uri(), "test-key").unwrap();
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let (listener_task, worker_task) = spawn(
+            socket,
+            client,
+            "7".into(),
+            Some(queue.clone()),
+            Vec::new(),
+            shutdown_rx,
+        );
+
+        let sender = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        sender
+            .send_to(
+                &encode_logged_adif("WSJT-X", "<CALL:5>VK3AB <EOR>"),
+                listen_addr,
+            )
+            .await
+            .unwrap();
+
+        // Spin until the queue drains (POST landed → remove called).
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        loop {
+            if queue.len().await == 0 {
+                break;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                panic!(
+                    "queue still holds {} entries after success",
+                    queue.len().await,
+                );
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        let _ = shutdown_tx.send(true);
+        let _ = tokio::time::timeout(Duration::from_secs(2), listener_task).await;
+        let _ = tokio::time::timeout(Duration::from_secs(2), worker_task).await;
+
+        // Re-open the file: zero entries means the worker actually
+        // wrote the removal back to disk, not just memory.
+        drop(queue);
+        let (_reopened, replay) = QsoQueue::open(queue_path).await.unwrap();
+        assert!(
+            replay.is_empty(),
+            "queue file should be empty after success"
+        );
+    }
+
+    #[tokio::test]
+    async fn persisted_adif_is_kept_when_wavelog_returns_5xx() {
+        // 5xx is retryable. After exhausting [0,1,4]s retries the
+        // worker must leave the entry on disk for next-startup replay.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/qso"))
+            .respond_with(ResponseTemplate::new(503))
+            .mount(&server)
+            .await;
+
+        let dir = tempfile::tempdir().unwrap();
+        let queue_path = dir.path().join("queue.jsonl");
+        let (queue, _replay) = QsoQueue::open(queue_path.clone()).await.unwrap();
+        let queue = std::sync::Arc::new(queue);
+
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let listen_addr = socket.local_addr().unwrap();
+        let client = WavelogClient::new(&server.uri(), "test-key").unwrap();
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let (listener_task, worker_task) = spawn(
+            socket,
+            client,
+            "7".into(),
+            Some(queue.clone()),
+            Vec::new(),
+            shutdown_rx,
+        );
+
+        let sender = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        sender
+            .send_to(
+                &encode_logged_adif("WSJT-X", "<CALL:5>VK3AB <EOR>"),
+                listen_addr,
+            )
+            .await
+            .unwrap();
+
+        // Wait long enough for [0,1,4]s retry exhaustion (~5s).
+        tokio::time::sleep(Duration::from_secs(6)).await;
+        assert_eq!(
+            queue.len().await,
+            1,
+            "5xx after retry exhaustion must keep entry on disk for next-startup replay",
+        );
+
+        let _ = shutdown_tx.send(true);
+        let _ = tokio::time::timeout(Duration::from_secs(2), listener_task).await;
+        let _ = tokio::time::timeout(Duration::from_secs(2), worker_task).await;
+    }
+
+    #[tokio::test]
+    async fn replay_entries_are_pushed_through_worker_at_startup() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/qso"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "status": "created",
+            })))
+            .mount(&server)
+            .await;
+
+        let dir = tempfile::tempdir().unwrap();
+        let queue_path = dir.path().join("queue.jsonl");
+
+        // Pre-seed the queue with 2 entries (simulating leftover from
+        // a prior daemon run).
+        let (queue, _) = QsoQueue::open(queue_path.clone()).await.unwrap();
+        queue.append("<CALL:5>K1AAA <EOR>".into()).await.unwrap();
+        queue.append("<CALL:5>K1BBB <EOR>".into()).await.unwrap();
+        drop(queue);
+
+        // Re-open and feed the replay back into a fresh spawn.
+        let (queue, replay) = QsoQueue::open(queue_path.clone()).await.unwrap();
+        let queue = std::sync::Arc::new(queue);
+        assert_eq!(replay.len(), 2);
+
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let client = WavelogClient::new(&server.uri(), "test-key").unwrap();
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let (listener_task, worker_task) = spawn(
+            socket,
+            client,
+            "7".into(),
+            Some(queue.clone()),
+            replay.into_vec(),
+            shutdown_rx,
+        );
+
+        // Spin for both replays to land.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        loop {
+            let posts = server.received_requests().await.unwrap_or_default().len();
+            if posts >= 2 {
+                break;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                panic!("expected 2 replayed POSTs, got {posts}");
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        // And the queue should now be empty in memory + on disk.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            if queue.len().await == 0 {
+                break;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                panic!("queue did not drain after replay+success");
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        let _ = shutdown_tx.send(true);
+        let _ = tokio::time::timeout(Duration::from_secs(2), listener_task).await;
+        let _ = tokio::time::timeout(Duration::from_secs(2), worker_task).await;
     }
 }

@@ -24,6 +24,7 @@ use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::http::HeaderValue as TungHeaderValue;
 use tokio_tungstenite::tungstenite::protocol::Message as TungMessage;
 use wavelog_bridge::modes::ModeOverrides;
+use wavelog_bridge::qso_queue::QsoQueue;
 use wavelog_bridge::wavelog::WavelogClient;
 use wavelog_bridge::ws::WsBandmapHandle;
 use wavelog_bridge::{listener, poller, rigctld, ws, wsjtx};
@@ -89,11 +90,9 @@ async fn handle_mock_session(stream: TcpStream, recorded: Arc<Mutex<Vec<String>>
 
 #[tokio::test]
 async fn full_round_trip_outbound_and_inbound() {
-    // --- mock rigctld ---
     let mock_rig = spawn_recording_rigctld().await;
     let (rig_handle, rig_join) = rigctld::spawn(mock_rig.addr, Duration::from_secs(3));
 
-    // --- wiremock wavelog ---
     let wavelog_server = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/api/radio"))
@@ -102,16 +101,13 @@ async fn full_round_trip_outbound_and_inbound() {
         .await;
     let client = WavelogClient::new(&wavelog_server.uri(), "test-key").unwrap();
 
-    // --- listener (real bind) ---
     let tcp_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let listener_addr = tcp_listener.local_addr().unwrap();
 
-    // --- ws bandmap (real bind) ---
     let ws_tcp_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let ws_addr = ws_tcp_listener.local_addr().unwrap();
     let ws_handle = WsBandmapHandle::new("FT-710".into(), 100.0);
 
-    // --- shutdown channel ---
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
     let poller_task = tokio::spawn(poller::run(
@@ -146,7 +142,7 @@ async fn full_round_trip_outbound_and_inbound() {
     // Give the poller a couple of tick windows to push at least once.
     tokio::time::sleep(Duration::from_millis(200)).await;
 
-    // --- inbound: click a DX-cluster spot ---
+    // Click a DX-cluster spot
     let url = format!("http://{listener_addr}/14074000/usb");
     let response = tokio::time::timeout(Duration::from_secs(5), reqwest::get(&url))
         .await
@@ -154,7 +150,6 @@ async fn full_round_trip_outbound_and_inbound() {
         .expect("reqwest GET failed");
     assert_eq!(response.status(), reqwest::StatusCode::OK);
 
-    // --- outbound: wavelog received a JSON POST with the expected shape ---
     let requests = wavelog_server.received_requests().await.unwrap();
     assert!(
         !requests.is_empty(),
@@ -167,7 +162,6 @@ async fn full_round_trip_outbound_and_inbound() {
     assert_eq!(body["mode"], "USB");
     assert!((body["power"].as_f64().unwrap() - 10.0).abs() < 1e-3);
 
-    // --- inbound assertion: rigctld received F and M from the listener ---
     let recorded = mock_rig.commands();
     assert!(
         recorded.contains(&"F 14074000".to_owned()),
@@ -178,7 +172,6 @@ async fn full_round_trip_outbound_and_inbound() {
         "missing `M USB -1` in {recorded:?}",
     );
 
-    // --- ws bandmap: connect a client and observe a radio_status frame ---
     let ws_url = format!("ws://{ws_addr}/");
     let mut req = ws_url.into_client_request().unwrap();
     req.headers_mut().insert(
@@ -220,14 +213,11 @@ async fn full_round_trip_outbound_and_inbound() {
     assert_eq!(radio_status_body["frequency"], 14_000_000);
     assert_eq!(radio_status_body["mode"], "USB");
     assert!((radio_status_body["power"].as_f64().unwrap() - 10.0).abs() < 1e-3);
-    // Wavelog's cat.js does `Date.now() - data.timestamp`, so the
-    // wire contract is epoch milliseconds, not an RFC3339 string.
     let ts = radio_status_body["timestamp"]
         .as_u64()
         .expect("timestamp must be epoch ms (u64)");
     assert!(ts >= 1_577_836_800_000, "timestamp {ts} too small");
 
-    // --- shutdown ---
     let _ = shutdown_tx.send(true);
     let _ = tokio::time::timeout(Duration::from_secs(2), poller_task).await;
     let _ = tokio::time::timeout(Duration::from_secs(2), listener_task).await;
@@ -256,7 +246,6 @@ fn encode_wsjtx_logged_adif(id: &str, adif: &str) -> Vec<u8> {
 
 #[tokio::test]
 async fn wsjtx_udp_message_forwards_to_wavelog_qso_endpoint() {
-    // --- wiremock Wavelog with /api/qso ---
     let wavelog_server = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/api/qso"))
@@ -266,22 +255,27 @@ async fn wsjtx_udp_message_forwards_to_wavelog_qso_endpoint() {
         .mount(&wavelog_server)
         .await;
 
-    // --- bind UDP socket on ephemeral port ---
     let udp_listener = UdpSocket::bind("127.0.0.1:0").await.unwrap();
     let listen_addr = udp_listener.local_addr().unwrap();
 
     let qso_client = WavelogClient::new(&wavelog_server.uri(), "test-key").unwrap();
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
-    let (listener_task, worker_task) =
-        wsjtx::spawn(udp_listener, qso_client, "5".into(), shutdown_rx);
+    let (listener_task, worker_task) = wsjtx::spawn(
+        udp_listener,
+        qso_client,
+        "5".into(),
+        None,
+        Vec::new(),
+        shutdown_rx,
+    );
 
-    // --- send a WSJT-X type-12 packet ---
+    // Send a WSJT-X type-12 packet
     let sender = UdpSocket::bind("127.0.0.1:0").await.unwrap();
     let adif = "<CALL:5>VK3AB <MODE:3>FT8 <FREQ:8>14.07400 <EOR>";
     let pkt = encode_wsjtx_logged_adif("WSJT-X", adif);
     sender.send_to(&pkt, listen_addr).await.unwrap();
 
-    // --- spin for the POST to land ---
+    // Spin for the POST to land
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     let body = loop {
         let requests = wavelog_server.received_requests().await.unwrap_or_default();
@@ -303,4 +297,179 @@ async fn wsjtx_udp_message_forwards_to_wavelog_qso_endpoint() {
     let _ = shutdown_tx.send(true);
     let _ = tokio::time::timeout(Duration::from_secs(2), listener_task).await;
     let _ = tokio::time::timeout(Duration::from_secs(2), worker_task).await;
+}
+
+/// End-to-end persistence happy path: a WSJT-X datagram lands on the
+/// UDP socket, gets persisted to disk *before* the POST, and is
+/// removed from disk after Wavelog confirms `status: "created"`.
+/// Mirrors what `main.rs` does at startup.
+#[tokio::test]
+async fn wsjtx_qso_persists_to_disk_then_drains_on_success() {
+    let wavelog_server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/qso"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "status": "created",
+        })))
+        .mount(&wavelog_server)
+        .await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let queue_path = dir.path().join("qso_queue.jsonl");
+
+    // Open the queue exactly the way main.rs does, including the
+    // `Arc::new` wrap that the spawn signature requires.
+    let (queue, replay) = QsoQueue::open(queue_path.clone()).await.unwrap();
+    assert!(replay.is_empty(), "fresh queue should have no entries");
+    let queue = Arc::new(queue);
+
+    let udp_listener = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let listen_addr = udp_listener.local_addr().unwrap();
+    let qso_client = WavelogClient::new(&wavelog_server.uri(), "test-key").unwrap();
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let (listener_task, worker_task) = wsjtx::spawn(
+        udp_listener,
+        qso_client,
+        "5".into(),
+        Some(Arc::clone(&queue)),
+        replay.into_vec(),
+        shutdown_rx,
+    );
+
+    let sender = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let adif = "<CALL:5>VK3AB <MODE:3>FT8 <FREQ:8>14.07400 <EOR>";
+    sender
+        .send_to(&encode_wsjtx_logged_adif("WSJT-X", adif), listen_addr)
+        .await
+        .unwrap();
+
+    // Wait for the full happy path: wavelog must observe the POST AND
+    // the queue must drain. Checking `is_empty` alone is a race —
+    // `is_empty` is true both before the listener picks up the UDP
+    // datagram (append hasn't happened) and after the worker removes
+    // the completed entry.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let posts = wavelog_server
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .len();
+        if posts >= 1 && queue.is_empty().await {
+            break;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            panic!(
+                "did not complete within 5s: {posts} POSTs, {} queue entries",
+                queue.len().await,
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    let _ = shutdown_tx.send(true);
+    let _ = tokio::time::timeout(Duration::from_secs(2), listener_task).await;
+    let _ = tokio::time::timeout(Duration::from_secs(2), worker_task).await;
+
+    // Re-open the file from disk: zero entries means the worker
+    // actually wrote the removal back, not just in-memory state.
+    drop(queue);
+    let (_, replay) = QsoQueue::open(queue_path).await.unwrap();
+    assert!(
+        replay.is_empty(),
+        "queue file should be empty after successful POST",
+    );
+
+    let requests = wavelog_server.received_requests().await.unwrap();
+    let body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+    assert_eq!(body["string"], adif);
+}
+
+/// End-to-end restart-replay path: a daemon crash leaves entries on
+/// disk; a fresh start opens the same file, replays its entries
+/// through the worker, and drains.
+#[tokio::test]
+async fn wsjtx_queue_replays_pending_entries_on_startup() {
+    let wavelog_server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/qso"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "status": "created",
+        })))
+        .mount(&wavelog_server)
+        .await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let queue_path = dir.path().join("qso_queue.jsonl");
+
+    // First daemon: seed the file with two pending QSOs without
+    // running the worker, then drop the queue.
+    let (seed_queue, _) = QsoQueue::open(queue_path.clone()).await.unwrap();
+    seed_queue
+        .append("<CALL:5>K1AAA <MODE:3>FT8 <EOR>".into())
+        .await
+        .unwrap();
+    seed_queue
+        .append("<CALL:5>K1BBB <MODE:3>FT8 <EOR>".into())
+        .await
+        .unwrap();
+    drop(seed_queue);
+
+    // Second daemon: re-open and let the spawned worker drain the
+    // replay before the listener task pulls any new datagrams.
+    let (queue, replay) = QsoQueue::open(queue_path.clone()).await.unwrap();
+    assert_eq!(replay.len(), 2, "replay should surface both seeded entries");
+    let queue = Arc::new(queue);
+
+    let udp_listener = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let qso_client = WavelogClient::new(&wavelog_server.uri(), "test-key").unwrap();
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let (listener_task, worker_task) = wsjtx::spawn(
+        udp_listener,
+        qso_client,
+        "5".into(),
+        Some(Arc::clone(&queue)),
+        replay.into_vec(),
+        shutdown_rx,
+    );
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let posts = wavelog_server
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .len();
+        if posts >= 2 && queue.is_empty().await {
+            break;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            panic!(
+                "replay did not complete: {posts} POSTs, {} entries left",
+                queue.len().await,
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    let _ = shutdown_tx.send(true);
+    let _ = tokio::time::timeout(Duration::from_secs(2), listener_task).await;
+    let _ = tokio::time::timeout(Duration::from_secs(2), worker_task).await;
+
+    let bodies: Vec<_> = wavelog_server
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .map(|r| serde_json::from_slice::<serde_json::Value>(&r.body).unwrap())
+        .map(|v| v["string"].as_str().unwrap().to_owned())
+        .collect();
+    assert!(
+        bodies.iter().any(|s| s.contains("K1AAA")),
+        "K1AAA missing from {bodies:?}",
+    );
+    assert!(
+        bodies.iter().any(|s| s.contains("K1BBB")),
+        "K1BBB missing from {bodies:?}",
+    );
 }

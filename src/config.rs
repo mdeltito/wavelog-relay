@@ -106,6 +106,14 @@ pub struct Cli {
     #[arg(long, env = "WAVELOG_BRIDGE_STATION_ID")]
     pub station_id: Option<String>,
 
+    /// Path to the persistent QSO queue (JSONL). Honored only when
+    /// `--wsjtx` is set. Defaults to
+    /// `$XDG_STATE_HOME/wavelog-bridge/qso_queue.jsonl` (or
+    /// `$HOME/.local/state/wavelog-bridge/qso_queue.jsonl`). The file
+    /// is created if absent.
+    #[arg(long, env = "WAVELOG_BRIDGE_QSO_QUEUE_PATH")]
+    pub qso_queue_path: Option<PathBuf>,
+
     /// Poll interval (e.g. 1s, 500ms). Default 1s.
     #[arg(long, env = "WAVELOG_BRIDGE_INTERVAL", value_parser = parse_duration)]
     pub interval: Option<Duration>,
@@ -181,6 +189,7 @@ struct TomlConfig {
     wsjtx: Option<bool>,
     wsjtx_listen: Option<SocketAddr>,
     station_id: Option<String>,
+    qso_queue_path: Option<PathBuf>,
     #[serde(default, with = "humantime_serde::option")]
     interval: Option<Duration>,
     #[serde(default, with = "humantime_serde::option")]
@@ -209,6 +218,10 @@ pub struct Config {
     /// [`Self::wsjtx`] is true — [`Config::merge`] enforces this:
     /// enabling WSJT-X without a station_id is a configuration error.
     pub station_id: Option<Box<str>>,
+    /// Filesystem path for the persistent QSO queue. Always populated
+    /// even when [`Self::wsjtx`] is false — the daemon only opens the
+    /// file when wsjtx is enabled, so the path being unused is fine.
+    pub qso_queue_path: PathBuf,
     pub poll_interval: Duration,
     pub log_level: Box<str>,
     pub mode_overrides: ModeOverrides,
@@ -353,6 +366,11 @@ impl Config {
             return Err(ConfigError::MissingStationId);
         }
 
+        let qso_queue_path = cli
+            .qso_queue_path
+            .or(toml.qso_queue_path)
+            .unwrap_or_else(default_qso_queue_path);
+
         let poll_interval = cli
             .interval
             .or(toml.interval)
@@ -388,6 +406,7 @@ impl Config {
             wsjtx,
             wsjtx_listen_addr,
             station_id,
+            qso_queue_path,
             poll_interval,
             log_level: log_level.into(),
             mode_overrides: toml.mode_overrides,
@@ -411,6 +430,20 @@ fn default_config_path() -> Option<PathBuf> {
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))?;
     Some(dir.join("wavelog-bridge").join("config.toml"))
+}
+
+/// Default path for the persistent QSO queue. Follows the XDG Base
+/// Directory spec: `$XDG_STATE_HOME/wavelog-bridge/qso_queue.jsonl`,
+/// falling back to `$HOME/.local/state/wavelog-bridge/qso_queue.jsonl`.
+/// If neither env var is set the file is placed under `./` — unusual
+/// in practice (systemd, login shells, even cron set HOME) but
+/// harmless for one-off invocations.
+fn default_qso_queue_path() -> PathBuf {
+    let dir = std::env::var_os("XDG_STATE_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local").join("state")))
+        .unwrap_or_else(|| PathBuf::from("."));
+    dir.join("wavelog-bridge").join("qso_queue.jsonl")
 }
 
 fn load_toml(explicit: Option<&Path>) -> Result<TomlConfig, ConfigError> {
@@ -495,6 +528,7 @@ mod tests {
             wsjtx: true,
             wsjtx_listen: Some("0.0.0.0:2237".parse().unwrap()),
             station_id: Some("3".to_owned()),
+            qso_queue_path: Some(PathBuf::from("/tmp/cli-queue.jsonl")),
             interval: Some(Duration::from_millis(500)),
             rig_timeout: Some(Duration::from_secs(5)),
             config: None,
@@ -589,6 +623,7 @@ mod tests {
             wsjtx: Some(false),
             wsjtx_listen: Some("127.0.0.1:9999".parse().unwrap()),
             station_id: Some("99".to_owned()),
+            qso_queue_path: Some(PathBuf::from("/tmp/toml-queue.jsonl")),
             interval: Some(Duration::from_secs(60)),
             rig_timeout: Some(Duration::from_secs(99)),
             log_level: Some("trace".to_owned()),
@@ -617,6 +652,7 @@ mod tests {
             "0.0.0.0:2237".parse::<SocketAddr>().unwrap()
         );
         assert_eq!(cfg.station_id.as_deref(), Some("3"));
+        assert_eq!(cfg.qso_queue_path, PathBuf::from("/tmp/cli-queue.jsonl"));
         assert_eq!(cfg.poll_interval, Duration::from_millis(500));
         assert_eq!(cfg.rig_timeout, Duration::from_secs(5));
         assert_eq!(&*cfg.log_level, "debug");
@@ -635,6 +671,7 @@ mod tests {
             wsjtx: Some(true),
             wsjtx_listen: Some("127.0.0.1:22222".parse().unwrap()),
             station_id: Some("42".to_owned()),
+            qso_queue_path: None,
             interval: Some(Duration::from_secs(2)),
             rig_timeout: Some(Duration::from_secs(7)),
             log_level: Some("warn".to_owned()),

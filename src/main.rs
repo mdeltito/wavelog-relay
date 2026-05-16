@@ -1,8 +1,11 @@
+use std::sync::Arc;
+
 use anyhow::{Context, anyhow};
 use clap::Parser;
 use tokio::sync::watch;
 use tracing_subscriber::EnvFilter;
 use wavelog_bridge::config::{Cli, Command, Config, StationsConfig};
+use wavelog_bridge::qso_queue::QsoQueue;
 use wavelog_bridge::wavelog::{Station, WavelogClient};
 use wavelog_bridge::ws::WsBandmapHandle;
 use wavelog_bridge::{listener, poller, rigctld, ws, wsjtx};
@@ -166,15 +169,32 @@ async fn run_daemon(cli: Cli) -> anyhow::Result<()> {
 
     // station_id is guaranteed Some when config.wsjtx is true — the
     // Config::merge check enforces it. Pair the socket with its
-    // station_id, build a WSJT-X listener+worker tuple, or fall
-    // through to no tasks.
+    // station_id, open the persistent QSO queue (replaying any
+    // pending entries), and build the WSJT-X listener + worker.
     let wsjtx_tasks = match (wsjtx_socket, config.station_id) {
-        (Some(socket), Some(station_id)) => Some(wsjtx::spawn(
-            socket,
-            client,
-            station_id,
-            shutdown_rx.clone(),
-        )),
+        (Some(socket), Some(station_id)) => {
+            let (queue, replay) = QsoQueue::open(config.qso_queue_path.clone())
+                .await
+                .with_context(|| {
+                    format!(
+                        "failed to open QSO queue at {}",
+                        config.qso_queue_path.display(),
+                    )
+                })?;
+            tracing::info!(
+                queue_path = %config.qso_queue_path.display(),
+                replay_count = replay.len(),
+                "wsjtx persistent queue opened",
+            );
+            Some(wsjtx::spawn(
+                socket,
+                client,
+                station_id,
+                Some(Arc::new(queue)),
+                replay.into_vec(),
+                shutdown_rx.clone(),
+            ))
+        },
         _ => None,
     };
 
