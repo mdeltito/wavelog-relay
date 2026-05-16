@@ -36,6 +36,7 @@ use tower_http::cors::{AllowOrigin, CorsLayer};
 
 use crate::modes::{Mode, ModeOverrides};
 use crate::rigctld::RigHandle;
+use crate::util::wait_for_shutdown;
 
 #[derive(Debug, Error)]
 pub enum ListenerError {
@@ -138,20 +139,6 @@ async fn tune(
 
     tracing::info!(freq, mode = hamlib.as_str(), "click-to-tune");
     (StatusCode::OK, Body::empty()).into_response()
-}
-
-async fn wait_for_shutdown(mut shutdown: watch::Receiver<bool>) {
-    if *shutdown.borrow_and_update() {
-        return;
-    }
-    loop {
-        if shutdown.changed().await.is_err() {
-            return;
-        }
-        if *shutdown.borrow() {
-            return;
-        }
-    }
 }
 
 #[cfg(test)]

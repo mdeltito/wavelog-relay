@@ -4,6 +4,7 @@ pub mod modes;
 pub mod poller;
 pub mod qso_queue;
 pub mod rigctld;
+mod util;
 pub mod wavelog;
 pub mod ws;
 pub mod wsjtx;

@@ -44,13 +44,14 @@
 //!   supported. The behaviour is undefined; documented in the README.
 
 use std::path::PathBuf;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio::fs::{self, OpenOptions};
 use tokio::io::AsyncWriteExt;
 use tokio::sync::Mutex;
+
+use crate::util::epoch_millis;
 
 /// Hardcoded cap on retained queue entries. ~5 hours of contest-rate
 /// FT8 (one log every ~15s × 1000 = ~4 hours) — well beyond any
@@ -87,9 +88,6 @@ struct Inner {
     next_seq: u64,
 }
 
-/// Snapshot of the entries already on disk at open time. The caller
-/// (typically `main.rs`) primes the POST worker queue with these so a
-/// prior run's pending submissions get retried.
 #[derive(Debug, Default)]
 pub struct ReplayEntries(Vec<(u64, Box<str>)>);
 
@@ -108,12 +106,9 @@ impl ReplayEntries {
 }
 
 impl QsoQueue {
-    /// Open or create the queue at `path`.
-    ///
-    /// Creates the parent directory if needed. A corrupt file is
-    /// renamed aside (`<path>.corrupt-<unix-ms>`) and the queue
-    /// starts fresh — refusing to start would be hostile to the
-    /// operator and the file is recoverable manually anyway.
+    /// Open or create the queue at `path`. Creates parent dirs as
+    /// needed. A corrupt file is renamed to `<path>.corrupt-<unix-ms>`
+    /// and the queue starts fresh.
     pub async fn open(path: PathBuf) -> Result<(Self, ReplayEntries), QsoQueueError> {
         if let Some(parent) = path.parent()
             && !parent.as_os_str().is_empty()
@@ -124,7 +119,7 @@ impl QsoQueue {
             Ok(contents) => match parse_entries(&contents) {
                 Ok(e) => e,
                 Err(e) => {
-                    let backup = path.with_extension(format!("corrupt-{}", epoch_ms()));
+                    let backup = path.with_extension(format!("corrupt-{}", epoch_millis()));
                     tracing::warn!(
                         error = %e,
                         backup = %backup.display(),
@@ -155,13 +150,9 @@ impl QsoQueue {
         ))
     }
 
-    /// Append an ADIF to the queue and durably persist before
-    /// returning. Returns the sequence number used by [`Self::remove`]
-    /// to mark the entry as completed.
-    ///
-    /// Enforces [`MAX_QUEUE_LEN`] by FIFO eviction with a WARN per
-    /// dropped entry. Overflow forces a full file rewrite — the
-    /// non-overflow path is a fast single-line append + fsync.
+    /// Persist an ADIF and return its sequence number (passed to
+    /// [`Self::remove`] on completion). Enforces [`MAX_QUEUE_LEN`] via
+    /// FIFO eviction with a WARN per dropped entry.
     pub async fn append(&self, adif: Box<str>) -> Result<u64, QsoQueueError> {
         let mut inner = self.inner.lock().await;
         let seq = inner.next_seq;
@@ -169,7 +160,7 @@ impl QsoQueue {
         let entry = Entry {
             seq,
             adif,
-            received_at: epoch_ms(),
+            received_at: epoch_millis(),
         };
         inner.entries.push(entry.clone());
 
@@ -254,13 +245,6 @@ fn parse_entries(contents: &str) -> Result<Vec<Entry>, serde_json::Error> {
         .filter(|l| !l.trim().is_empty())
         .map(serde_json::from_str)
         .collect()
-}
-
-fn epoch_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
 }
 
 #[cfg(test)]

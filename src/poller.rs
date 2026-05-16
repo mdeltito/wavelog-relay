@@ -32,6 +32,7 @@ use tokio::sync::watch;
 use tokio::time::{Instant, MissedTickBehavior, interval};
 
 use crate::rigctld::{RigHandle, RigState};
+use crate::util::shutdown_observed;
 use crate::wavelog::WavelogClient;
 use crate::ws::WsBandmapHandle;
 
@@ -91,8 +92,7 @@ pub async fn run(
                 }
             }
             result = shutdown.changed() => {
-                let should_stop = result.is_err() || *shutdown.borrow();
-                if should_stop {
+                if shutdown_observed(result, &shutdown) {
                     tracing::info!("poller shutting down");
                     break;
                 }
@@ -150,8 +150,7 @@ async fn radio_worker(
                         }
                     }
                     res = shutdown.changed() => {
-                        let should_stop = res.is_err() || *shutdown.borrow();
-                        if should_stop {
+                        if shutdown_observed(res, &shutdown) {
                             tracing::info!("radio worker shutting down (mid-push)");
                             return;
                         }
@@ -159,8 +158,7 @@ async fn radio_worker(
                 }
             }
             result = shutdown.changed() => {
-                let should_stop = result.is_err() || *shutdown.borrow();
-                if should_stop {
+                if shutdown_observed(result, &shutdown) {
                     tracing::info!("radio worker shutting down");
                     return;
                 }

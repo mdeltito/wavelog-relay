@@ -28,7 +28,6 @@
 
 use std::io;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::Router;
 use axum::extract::State;
@@ -42,6 +41,7 @@ use tokio::net::TcpListener;
 use tokio::sync::{broadcast, watch};
 
 use crate::rigctld::RigState;
+use crate::util::{epoch_millis, shutdown_observed, wait_for_shutdown};
 
 const CHANNEL_CAPACITY: usize = 16;
 const WELCOME_FRAME: &str = r#"{"type":"welcome"}"#;
@@ -129,13 +129,6 @@ struct RadioStatus<'a> {
     /// indicator — anything other than a numeric epoch-ms produces NaN
     /// and the staleness state never fires.
     timestamp: u64,
-}
-
-fn epoch_millis() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
 }
 
 /// Run the WebSocket bandmap server on a pre-bound TCP listener until
@@ -230,8 +223,7 @@ async fn handle_connection(
             biased;
 
             result = shutdown.changed() => {
-                let should_stop = result.is_err() || *shutdown.borrow();
-                if should_stop {
+                if shutdown_observed(result, &shutdown) {
                     let _ = socket.send(Message::Close(None)).await;
                     return;
                 }
@@ -272,20 +264,6 @@ async fn handle_connection(
                     return;
                 }
             }
-        }
-    }
-}
-
-async fn wait_for_shutdown(mut shutdown: watch::Receiver<bool>) {
-    if *shutdown.borrow_and_update() {
-        return;
-    }
-    loop {
-        if shutdown.changed().await.is_err() {
-            return;
-        }
-        if *shutdown.borrow() {
-            return;
         }
     }
 }

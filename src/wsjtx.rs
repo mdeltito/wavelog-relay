@@ -34,6 +34,7 @@ use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 
 use crate::qso_queue::QsoQueue;
+use crate::util::shutdown_observed;
 use crate::wavelog::{WavelogClient, WavelogError};
 
 const MAGIC: u32 = 0xadbc_cbda;
@@ -182,8 +183,7 @@ async fn listen(
                 }
             }
             result = shutdown.changed() => {
-                let should_stop = result.is_err() || *shutdown.borrow();
-                if should_stop {
+                if shutdown_observed(result, &shutdown) {
                     tracing::info!("wsjtx listener shutting down (during replay)");
                     return;
                 }
@@ -251,8 +251,7 @@ async fn listen(
                 }
             },
             result = shutdown.changed() => {
-                let should_stop = result.is_err() || *shutdown.borrow();
-                if should_stop {
+                if shutdown_observed(result, &shutdown) {
                     tracing::info!("wsjtx listener shutting down");
                     return;
                 }
@@ -285,8 +284,7 @@ async fn post_loop(
                             handle_post_outcome(push_res, item.seq, queue.as_deref()).await;
                         },
                         result = shutdown.changed() => {
-                            let should_stop = result.is_err() || *shutdown.borrow();
-                            if should_stop {
+                            if shutdown_observed(result, &shutdown) {
                                 tracing::info!("wsjtx POST worker shutting down (mid-push)");
                                 return;
                             }
@@ -296,8 +294,7 @@ async fn post_loop(
                 None => return,
             },
             result = shutdown.changed() => {
-                let should_stop = result.is_err() || *shutdown.borrow();
-                if should_stop {
+                if shutdown_observed(result, &shutdown) {
                     tracing::info!("wsjtx POST worker shutting down");
                     return;
                 }
