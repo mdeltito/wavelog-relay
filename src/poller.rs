@@ -32,7 +32,7 @@ use tokio::sync::watch;
 use tokio::time::{Instant, MissedTickBehavior, interval};
 
 use crate::rigctld::{RigHandle, RigState};
-use crate::wavelog::{WavelogClient, WavelogError};
+use crate::wavelog::WavelogClient;
 use crate::ws::WsBandmapHandle;
 
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
@@ -146,7 +146,7 @@ async fn radio_worker(
                     push_res = client.push_radio(&radio, &state, power_max_watts) => {
                         match push_res {
                             Ok(()) => deduper.record(&state, now),
-                            Err(e) => log_push_failure(&e),
+                            Err(e) => tracing::warn!(error = %e, "wavelog push failed"),
                         }
                     }
                     res = shutdown.changed() => {
@@ -167,10 +167,6 @@ async fn radio_worker(
             }
         }
     }
-}
-
-fn log_push_failure(err: &WavelogError) {
-    tracing::warn!(error = %err, "wavelog push failed");
 }
 
 /// Per-poller dedupe state. Skips a push when frequency, mode, and a

@@ -450,9 +450,12 @@ async fn exec_get_mode(conn: &mut Connection) -> io::Result<Result<Box<str>, Rig
         // Empty mode line is a malformed reply — surfacing it as
         // BadResponse beats letting "" leak into the wavelog payload.
         // Owned snapshot so we can release the read buffer borrow and
-        // still drain the passband line that follows.
+        // still drain the passband line that follows. Suppress drain
+        // I/O errors so the original BadResponse isn't masked by a
+        // disconnect during cleanup; the next command will surface
+        // the disconnect on its own.
         let snapshot: Box<str> = line1.into();
-        let _ = conn.read_line().await?;
+        let _ = conn.read_line().await;
         return Ok(Err(RigError::BadResponse(snapshot)));
     }
     let mode: Box<str> = token.into();
@@ -479,7 +482,7 @@ async fn exec_get_power(conn: &mut Connection) -> io::Result<Result<f32, RigErro
     // rather than reject — the alternative is dropping every snapshot
     // whenever the rig sits at full power.
     let clamped = raw.clamp(0.0, 1.0);
-    if (raw - clamped).abs() > f32::EPSILON {
+    if !(0.0..=1.0).contains(&raw) {
         tracing::warn!(raw, clamped, "rigctld RFPOWER out of [0,1] range; clamping");
     }
     Ok(Ok(clamped))

@@ -74,9 +74,9 @@ struct Entry {
 
 /// On-disk-backed queue of pending QSO submissions.
 ///
-/// Cheap to clone (the inner state is `Arc`-shared via the underlying
-/// `Mutex`). Construct one via [`QsoQueue::open`]; the same handle is
-/// used by the listener (`append`) and the POST worker (`remove`).
+/// Wrap in an `Arc` to share between tasks. Construct one via
+/// [`QsoQueue::open`]; the listener (`append`) and POST worker
+/// (`remove`) hold the same handle.
 pub struct QsoQueue {
     path: PathBuf,
     inner: Mutex<Inner>,
@@ -175,13 +175,12 @@ impl QsoQueue {
 
         let needs_rewrite = if inner.entries.len() > MAX_QUEUE_LEN {
             let drop_count = inner.entries.len() - MAX_QUEUE_LEN;
-            let dropped: Vec<_> = inner.entries.drain(0..drop_count).collect();
-            for d in &dropped {
-                tracing::warn!(
-                    seq = d.seq,
-                    "QSO queue at cap ({MAX_QUEUE_LEN}); dropping oldest entry",
-                );
-            }
+            inner.entries.drain(0..drop_count);
+            tracing::warn!(
+                dropped = drop_count,
+                cap = MAX_QUEUE_LEN,
+                "QSO queue at cap; dropping oldest entries",
+            );
             true
         } else {
             false

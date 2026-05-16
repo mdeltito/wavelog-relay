@@ -137,23 +137,7 @@ pub fn spawn(
     shutdown: watch::Receiver<bool>,
 ) -> (JoinHandle<()>, JoinHandle<()>) {
     let (tx, rx) = mpsc::channel::<QueueItem>(QUEUE_CAPACITY);
-
-    // Prime the worker channel with replay entries before the
-    // listener task starts pulling in new datagrams. blocking_send is
-    // wrong here — we're inside an async fn — but try_send is bounded
-    // by QUEUE_CAPACITY. If replay > capacity the surplus is dropped
-    // (unlikely in practice; cap is larger than typical replay).
-    for (seq, adif) in replay {
-        if let Err(e) = tx.try_send(QueueItem {
-            seq: Some(seq),
-            adif,
-        }) {
-            tracing::warn!(error = ?e, "wsjtx replay queue overflowed");
-            break;
-        }
-    }
-
-    let listener = tokio::spawn(listen(socket, tx, queue.clone(), shutdown.clone()));
+    let listener = tokio::spawn(listen(socket, tx, queue.clone(), replay, shutdown.clone()));
     let worker = tokio::spawn(post_loop(rx, client, station_id, queue, shutdown));
     (listener, worker)
 }
@@ -172,6 +156,7 @@ async fn listen(
     socket: UdpSocket,
     tx: mpsc::Sender<QueueItem>,
     queue: Option<Arc<QsoQueue>>,
+    replay: Vec<(u64, Box<str>)>,
     mut shutdown: watch::Receiver<bool>,
 ) {
     if let Ok(addr) = socket.local_addr() {
@@ -180,6 +165,32 @@ async fn listen(
     if *shutdown.borrow_and_update() {
         return;
     }
+
+    // Prime the worker with replay entries before pulling any new
+    // datagrams off the socket. send().await back-pressures on a full
+    // channel so a deep replay (longer than QUEUE_CAPACITY) is fully
+    // delivered to the worker rather than silently dropped. New
+    // datagrams sit in the kernel UDP buffer until the recv loop
+    // starts; in practice the priming completes in milliseconds even
+    // for a maxed-out queue.
+    for (seq, adif) in replay {
+        tokio::select! {
+            res = tx.send(QueueItem { seq: Some(seq), adif }) => {
+                if res.is_err() {
+                    tracing::warn!("wsjtx POST worker channel closed during replay; exiting listener");
+                    return;
+                }
+            }
+            result = shutdown.changed() => {
+                let should_stop = result.is_err() || *shutdown.borrow();
+                if should_stop {
+                    tracing::info!("wsjtx listener shutting down (during replay)");
+                    return;
+                }
+            }
+        }
+    }
+
     let mut buf = vec![0u8; RECV_BUF_SIZE];
     loop {
         tokio::select! {
