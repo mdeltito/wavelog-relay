@@ -1,6 +1,6 @@
 //! End-to-end test that wires real rigctld actor + axum listener +
 //! wavelog client + wiremock together and exercises both directions
-//! of the bridge in a single scenario.
+//! of the relay in a single scenario.
 //!
 //! Outbound: the 1 Hz poller reads rig state via the actor and POSTs
 //! to wiremock-backed `/api/radio`.
@@ -23,11 +23,11 @@ use tokio::sync::watch;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::http::HeaderValue as TungHeaderValue;
 use tokio_tungstenite::tungstenite::protocol::Message as TungMessage;
-use wavelog_bridge::modes::ModeOverrides;
-use wavelog_bridge::qso_queue::QsoQueue;
-use wavelog_bridge::wavelog::WavelogClient;
-use wavelog_bridge::ws::WsHandle;
-use wavelog_bridge::{listener, poller, rigctld, ws, wsjtx};
+use wavelog_relay::modes::ModeOverrides;
+use wavelog_relay::qso_queue::QsoQueue;
+use wavelog_relay::wavelog::WavelogClient;
+use wavelog_relay::ws::WsHandle;
+use wavelog_relay::{listener, poller, rigctld, ws, wsjtx};
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 

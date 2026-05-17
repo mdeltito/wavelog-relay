@@ -29,7 +29,7 @@ const RETRY_SLEEPS: [Duration; 3] = [
     Duration::from_secs(4),
 ];
 const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
-const USER_AGENT: &str = concat!("wavelog-bridge/", env!("CARGO_PKG_VERSION"));
+const USER_AGENT: &str = concat!("wavelog-relay/", env!("CARGO_PKG_VERSION"));
 
 #[derive(Clone)]
 pub struct WavelogClient {

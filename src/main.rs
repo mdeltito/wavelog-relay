@@ -4,11 +4,11 @@ use anyhow::{Context, anyhow};
 use clap::Parser;
 use tokio::sync::watch;
 use tracing_subscriber::EnvFilter;
-use wavelog_bridge::config::{Cli, Command, Config, StationsConfig};
-use wavelog_bridge::qso_queue::QsoQueue;
-use wavelog_bridge::wavelog::{Station, WavelogClient};
-use wavelog_bridge::ws::WsHandle;
-use wavelog_bridge::{listener, poller, rigctld, ws, wsjtx};
+use wavelog_relay::config::{Cli, Command, Config, StationsConfig};
+use wavelog_relay::qso_queue::QsoQueue;
+use wavelog_relay::wavelog::{Station, WavelogClient};
+use wavelog_relay::ws::WsHandle;
+use wavelog_relay::{listener, poller, rigctld, ws, wsjtx};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -90,7 +90,7 @@ async fn run_daemon(cli: Cli) -> anyhow::Result<()> {
         wsjtx_listen = %config.wsjtx_listen_addr,
         interval = ?config.poll_interval,
         rig_timeout = ?config.rig_timeout,
-        "wavelog-bridge starting"
+        "wavelog-relay starting"
     );
 
     // Bind all listeners up front so port conflicts exit non-zero before any task spawns.

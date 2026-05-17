@@ -1,14 +1,14 @@
 //! CLI + TOML + env configuration.
 //!
-//! Precedence at merge time: CLI > env (`WAVELOG_BRIDGE_*`) > TOML > defaults.
+//! Precedence at merge time: CLI > env (`WAVELOG_RELAY_*`) > TOML > defaults.
 //! The optional TOML file is auto-discovered at
-//! `$XDG_CONFIG_HOME/wavelog-bridge/config.toml` (or `$HOME/.config/...`)
+//! `$XDG_CONFIG_HOME/wavelog-relay/config.toml` (or `$HOME/.config/...`)
 //! unless `--config` overrides the path.
 //!
 //! The Wavelog API key is resolved separately from the rest of the
 //! settings to keep it off `argv` (where it would show up in `ps`):
-//! `WAVELOG_BRIDGE_KEY` (raw value) wins over a key file path supplied
-//! through `--key-file` or `WAVELOG_BRIDGE_KEY_FILE`.
+//! `WAVELOG_RELAY_KEY` (raw value) wins over a key file path supplied
+//! through `--key-file` or `WAVELOG_RELAY_KEY_FILE`.
 
 use std::io;
 use std::net::SocketAddr;
@@ -33,98 +33,98 @@ const DEFAULT_RIG_TIMEOUT: Duration = Duration::from_secs(3);
 const DEFAULT_LOG_LEVEL: &str = "info";
 
 #[derive(Debug, Default, Parser)]
-#[command(version, about = "Rust bridge between rigctld and Wavelog")]
+#[command(version, about = "Relay between rigctld and Wavelog")]
 pub struct Cli {
-    /// Optional subcommand. When omitted, runs the bridge daemon.
+    /// Optional subcommand. When omitted, runs the daemon.
     #[command(subcommand)]
     pub command: Option<Command>,
 
     /// rigctld host:port. Accepts IPv4/IPv6 socket addresses
     /// (`127.0.0.1:4532`, `[::1]:4532`) or hostnames (`rig.local:4532`).
     /// Default 127.0.0.1:4532.
-    #[arg(long, env = "WAVELOG_BRIDGE_RIGCTLD")]
+    #[arg(long, env = "WAVELOG_RELAY_RIGCTLD")]
     pub rigctld: Option<Endpoint>,
 
     /// Wavelog base URL (e.g. https://wavelog.example.com/index.php).
-    #[arg(long, env = "WAVELOG_BRIDGE_WAVELOG_URL", global = true)]
+    #[arg(long, env = "WAVELOG_RELAY_WAVELOG_URL", global = true)]
     pub wavelog_url: Option<String>,
 
     /// Radio identifier sent to Wavelog (e.g. FT-710).
-    #[arg(long, env = "WAVELOG_BRIDGE_RADIO")]
+    #[arg(long, env = "WAVELOG_RELAY_RADIO")]
     pub radio: Option<String>,
 
     /// Path to a file containing the Wavelog API key.
-    #[arg(long, env = "WAVELOG_BRIDGE_KEY_FILE", global = true)]
+    #[arg(long, env = "WAVELOG_RELAY_KEY_FILE", global = true)]
     pub key_file: Option<PathBuf>,
 
     /// Rig's max RF power in watts, used to scale rigctld's 0.0..=1.0
     /// RFPOWER reading. Default 100.
-    #[arg(long, env = "WAVELOG_BRIDGE_POWER_MAX")]
+    #[arg(long, env = "WAVELOG_RELAY_POWER_MAX")]
     pub power_max: Option<f32>,
 
     /// Listener bind address. Default 127.0.0.1:54321.
-    #[arg(long, env = "WAVELOG_BRIDGE_LISTEN")]
+    #[arg(long, env = "WAVELOG_RELAY_LISTEN")]
     pub listen: Option<SocketAddr>,
 
     /// WebSocket bind address. The Wavelog frontend
     /// (`assets/js/cat.js`) hardcodes a fallback to `ws://127.0.0.1:54322`,
     /// so changing this is only useful for local testing or to avoid
-    /// a port conflict before fronting the bridge with a reverse proxy.
+    /// a port conflict before fronting with a reverse proxy.
     /// Default 127.0.0.1:54322.
-    #[arg(long, env = "WAVELOG_BRIDGE_WS_LISTEN")]
+    #[arg(long, env = "WAVELOG_RELAY_WS_LISTEN")]
     pub ws_listen: Option<SocketAddr>,
 
     /// Disable the WebSocket server entirely (no bind on
     /// `--ws-listen`). The Wavelog frontend will fall back to its 3 s
     /// AJAX poll for rig-card updates.
-    #[arg(long, env = "WAVELOG_BRIDGE_NO_WS")]
+    #[arg(long, env = "WAVELOG_RELAY_NO_WS")]
     pub no_ws: bool,
 
     /// Enable the WSJT-X UDP listener. Off by default — binds a UDP
     /// socket and forwards each `Logged ADIF` (type 12) datagram to
     /// Wavelog's `/api/qso`. Requires `--station-id` to be set as well
-    /// (look one up with `wavelog-bridge stations`).
-    #[arg(long, env = "WAVELOG_BRIDGE_WSJTX")]
+    /// (look one up with `wavelog-relay stations`).
+    #[arg(long, env = "WAVELOG_RELAY_WSJTX")]
     pub wsjtx: bool,
 
     /// Bind address for the WSJT-X UDP listener. Honored only when
     /// `--wsjtx` is set. Default 127.0.0.1:2237 — matches the WSJT-X
     /// "UDP Server" Reporting setting.
-    #[arg(long, env = "WAVELOG_BRIDGE_WSJTX_LISTEN")]
+    #[arg(long, env = "WAVELOG_RELAY_WSJTX_LISTEN")]
     pub wsjtx_listen: Option<SocketAddr>,
 
     /// Wavelog station profile ID for QSO submissions (the numeric
     /// `station_id` from `/api/station_info`). Required when
-    /// `--wsjtx` is set. Use `wavelog-bridge stations` to look up
+    /// `--wsjtx` is set. Use `wavelog-relay stations` to look up
     /// the IDs.
-    #[arg(long, env = "WAVELOG_BRIDGE_STATION_ID")]
+    #[arg(long, env = "WAVELOG_RELAY_STATION_ID")]
     pub station_id: Option<String>,
 
     /// Path to the persistent QSO queue (JSONL). Honored only when
     /// `--wsjtx` is set. Defaults to
-    /// `$XDG_STATE_HOME/wavelog-bridge/qso_queue.jsonl` (or
-    /// `$HOME/.local/state/wavelog-bridge/qso_queue.jsonl`). The file
+    /// `$XDG_STATE_HOME/wavelog-relay/qso_queue.jsonl` (or
+    /// `$HOME/.local/state/wavelog-relay/qso_queue.jsonl`). The file
     /// is created if absent.
-    #[arg(long, env = "WAVELOG_BRIDGE_QSO_QUEUE_PATH")]
+    #[arg(long, env = "WAVELOG_RELAY_QSO_QUEUE_PATH")]
     pub qso_queue_path: Option<PathBuf>,
 
     /// Poll interval (e.g. 1s, 500ms). Default 1s.
-    #[arg(long, env = "WAVELOG_BRIDGE_INTERVAL", value_parser = parse_duration)]
+    #[arg(long, env = "WAVELOG_RELAY_INTERVAL", value_parser = parse_duration)]
     pub interval: Option<Duration>,
 
     /// Per-command read timeout when talking to rigctld. If rigctld
     /// accepts a command but never replies within this window the
     /// connection is dropped and the actor reconnects via the standard
     /// backoff schedule. Default 3s.
-    #[arg(long, env = "WAVELOG_BRIDGE_RIG_TIMEOUT", value_parser = parse_duration)]
+    #[arg(long, env = "WAVELOG_RELAY_RIG_TIMEOUT", value_parser = parse_duration)]
     pub rig_timeout: Option<Duration>,
 
     /// Optional TOML config file. Auto-discovered if not given.
-    #[arg(long, env = "WAVELOG_BRIDGE_CONFIG", global = true)]
+    #[arg(long, env = "WAVELOG_RELAY_CONFIG", global = true)]
     pub config: Option<PathBuf>,
 
     /// Default tracing filter directive. RUST_LOG overrides.
-    #[arg(long, env = "WAVELOG_BRIDGE_LOG_LEVEL")]
+    #[arg(long, env = "WAVELOG_RELAY_LOG_LEVEL")]
     pub log_level: Option<String>,
 }
 
@@ -142,7 +142,7 @@ pub enum Command {
 
 /// Minimal credentials needed by one-shot subcommands. Reuses the
 /// daemon's TOML auto-discovery and key resolution so users don't need
-/// a second mental model for `wavelog-bridge stations`.
+/// a second mental model for `wavelog-relay stations`.
 #[derive(Debug)]
 pub struct StationsConfig {
     pub wavelog_url: Box<str>,
@@ -222,20 +222,18 @@ pub struct Config {
 
 #[derive(Debug, Error)]
 pub enum ConfigError {
-    #[error("missing required option: set --wavelog-url or WAVELOG_BRIDGE_WAVELOG_URL")]
+    #[error("missing required option: set --wavelog-url or WAVELOG_RELAY_WAVELOG_URL")]
     MissingWavelogUrl,
 
-    #[error("missing required option: set --radio or WAVELOG_BRIDGE_RADIO")]
+    #[error("missing required option: set --radio or WAVELOG_RELAY_RADIO")]
     MissingRadio,
 
-    #[error(
-        "missing API key: set WAVELOG_BRIDGE_KEY (raw) or WAVELOG_BRIDGE_KEY_FILE / --key-file"
-    )]
+    #[error("missing API key: set WAVELOG_RELAY_KEY (raw) or WAVELOG_RELAY_KEY_FILE / --key-file")]
     MissingKey,
 
     #[error(
-        "--wsjtx requires --station-id: run `wavelog-bridge stations` to look up your \
-         Wavelog station profile ID, then pass it via --station-id or WAVELOG_BRIDGE_STATION_ID"
+        "--wsjtx requires --station-id: run `wavelog-relay stations` to look up your \
+         Wavelog station profile ID, then pass it via --station-id or WAVELOG_RELAY_STATION_ID"
     )]
     MissingStationId,
 
@@ -408,17 +406,17 @@ fn default_config_path() -> Option<PathBuf> {
     let dir = std::env::var_os("XDG_CONFIG_HOME")
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))?;
-    Some(dir.join("wavelog-bridge").join("config.toml"))
+    Some(dir.join("wavelog-relay").join("config.toml"))
 }
 
-/// XDG state path: `$XDG_STATE_HOME/wavelog-bridge/qso_queue.jsonl`
-/// (or `~/.local/state/wavelog-bridge/qso_queue.jsonl`).
+/// XDG state path: `$XDG_STATE_HOME/wavelog-relay/qso_queue.jsonl`
+/// (or `~/.local/state/wavelog-relay/qso_queue.jsonl`).
 fn default_qso_queue_path() -> PathBuf {
     let dir = std::env::var_os("XDG_STATE_HOME")
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local").join("state")))
         .unwrap_or_else(|| PathBuf::from("."));
-    dir.join("wavelog-bridge").join("qso_queue.jsonl")
+    dir.join("wavelog-relay").join("qso_queue.jsonl")
 }
 
 fn load_toml(explicit: Option<&Path>) -> Result<TomlConfig, ConfigError> {
@@ -455,7 +453,7 @@ fn load_toml(explicit: Option<&Path>) -> Result<TomlConfig, ConfigError> {
 }
 
 fn resolve_key(cli_key_file: Option<&Path>) -> Result<String, ConfigError> {
-    if let Ok(raw) = std::env::var("WAVELOG_BRIDGE_KEY")
+    if let Ok(raw) = std::env::var("WAVELOG_RELAY_KEY")
         && !raw.is_empty()
     {
         return Ok(raw);

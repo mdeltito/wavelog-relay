@@ -1849,7 +1849,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "wavelog-bridge"
+name = "wavelog-relay"
 version = "0.1.0"
 dependencies = [
  "anyhow",

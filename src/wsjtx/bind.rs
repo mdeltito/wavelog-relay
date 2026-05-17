@@ -172,7 +172,7 @@ mod tests {
         // gun: when the multicast bind was 0.0.0.0:port + group join,
         // it picked up unicast packets to 127.0.0.1:port too. Locking
         // in the group-address bind on Linux prevents that and makes
-        // misconfiguration (WSJT-X unicasting when wavelog-bridge is
+        // misconfiguration (WSJT-X unicasting when wavelog-relay is
         // bound to multicast) visible immediately instead of silently
         // appearing to work until a peer like GT2 takes the port.
         let port = pick_free_udp_port().await;

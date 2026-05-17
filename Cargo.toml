@@ -1,10 +1,10 @@
 [package]
-name = "wavelog-bridge"
+name = "wavelog-relay"
 version = "0.1.0"
 authors = ["Michael J. Del Tito"]
 license = "MIT"
 edition = "2024"
-repository = "https://github.com/mdeltito/wavelog-bridge"
+repository = "https://github.com/mdeltito/wavelog-relay"
 
 [lints.clippy]
 collapsible_if = "allow"
@@ -45,7 +45,7 @@ panic = "abort"
 publish = false
 allow-branch = ["main"]
 tag-name = "v{{version}}"
-tag-message = "wavelog-bridge {{version}}"
+tag-message = "wavelog-relay {{version}}"
 pre-release-commit-message = "chore: release v{{version}}"
 sign-commit = false
 sign-tag = false
