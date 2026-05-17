@@ -53,5 +53,8 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: ${{ matrix.runner }}
-      - name: cargo test (all features)
-        run: cargo test --workspace --all-targets --all-features --no-fail-fast --locked
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest
+      - name: cargo nextest run (all features)
+        run: cargo nextest run --workspace --all-targets --all-features --locked --profile ci
