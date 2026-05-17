@@ -73,8 +73,6 @@ impl FromStr for Endpoint {
     type Err = EndpointParseError;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        // Pre-resolved SocketAddr handles `127.0.0.1:4532` and bracketed
-        // IPv6 (`[::1]:4532`) without DNS.
         if let Ok(addr) = s.parse::<SocketAddr>() {
             return Ok(Self::Resolved(addr));
         }
@@ -84,9 +82,6 @@ impl FromStr for Endpoint {
         if host.is_empty() {
             return Err(EndpointParseError::EmptyHost(s.into()));
         }
-        // Unbracketed IPv6 (`::1:4532`) is ambiguous: is the trailing
-        // `:4532` a port or part of the address? Refuse rather than
-        // guess; users must bracket.
         if host.contains(':') {
             return Err(EndpointParseError::AmbiguousIpv6 {
                 raw: s.into(),
@@ -182,26 +177,16 @@ impl RigHandle {
             .await
     }
 
-    /// Set frequency and mode atomically on the actor's socket. The
-    /// actor writes `F`/reads `RPRT`/writes `M`/reads `RPRT` inside a
-    /// single command dispatch — no other queued command (notably the
-    /// poller's `f`/`m`/`\get_level RFPOWER`) can land between them.
+    /// Atomic freq + mode set. No other queued command can interleave
+    /// on the shared socket between the `F` and `M` writes.
     pub async fn set_freq_mode(&self, hz: u64, mode: HamlibMode) -> Result<(), RigError> {
         self.request(|reply| RigCommand::SetFreqMode { hz, mode, reply })
             .await
     }
 
-    /// Read freq, mode and RFPOWER as a single atomic snapshot.
-    ///
-    /// All three reads happen inside one actor command dispatch — no
-    /// other queued command (notably a click-to-tune `set_freq_mode`)
-    /// can land between them, so the resulting [`RigState`] is always
-    /// internally consistent.
-    ///
-    /// RFPOWER is treated specially: backends that don't support
-    /// `\get_level RFPOWER` (returning `RPRT -11` or similar) yield
-    /// `power = None` rather than failing the whole snapshot. Other
-    /// I/O errors propagate.
+    /// Atomic freq + mode + RFPOWER snapshot. Backends that don't
+    /// support RFPOWER yield `power = None` rather than failing the
+    /// whole snapshot.
     pub async fn poll(&self) -> Result<RigState, RigError> {
         self.request(RigCommand::Poll).await
     }
@@ -263,6 +248,11 @@ impl RigActor {
             }
             let delay = backoff_delay(backoff_idx);
             backoff_idx = backoff_idx.saturating_add(1);
+            tracing::info!(
+                endpoint = %self.endpoint,
+                retry_in_ms = delay.as_millis() as u64,
+                "rigctld reconnect scheduled",
+            );
             if !self.sleep_draining(delay).await {
                 return;
             }
@@ -447,19 +437,14 @@ async fn exec_get_mode(conn: &mut Connection) -> io::Result<Result<Box<str>, Rig
     }
     let token = line1.split_whitespace().next().unwrap_or("");
     if token.is_empty() {
-        // Empty mode line is a malformed reply — surfacing it as
-        // BadResponse beats letting "" leak into the wavelog payload.
-        // Owned snapshot so we can release the read buffer borrow and
-        // still drain the passband line that follows. Suppress drain
-        // I/O errors so the original BadResponse isn't masked by a
-        // disconnect during cleanup; the next command will surface
-        // the disconnect on its own.
+        // Reject as BadResponse before "" reaches the wavelog payload.
+        // Drain the passband line so the connection stays in sync;
+        // suppress its I/O error to avoid masking the BadResponse.
         let snapshot: Box<str> = line1.into();
         let _ = conn.read_line().await;
         return Ok(Err(RigError::BadResponse(snapshot)));
     }
     let mode: Box<str> = token.into();
-    // Drain the passband line that follows on a successful response.
     conn.read_line().await?;
     Ok(Ok(mode))
 }
@@ -488,14 +473,9 @@ async fn exec_get_power(conn: &mut Connection) -> io::Result<Result<f32, RigErro
     Ok(Ok(clamped))
 }
 
-/// Read freq → mode → RFPOWER inside a single actor dispatch. The
-/// `?`-on-`io::Result` cascade is what gives us atomicity: nothing else
-/// in the actor's `recv` loop runs until this future resolves.
-///
-/// RFPOWER is special: a backend that returns `RPRT -N` for the level
-/// query produces `power = None` (the rig simply doesn't report it),
-/// not a failed snapshot. Other paths (Disconnected, BadResponse) still
-/// surface to the caller.
+/// Atomic by virtue of running inside one actor dispatch — nothing
+/// else in the recv loop runs until this resolves. Hamlib errors on
+/// RFPOWER become `power = None`; other errors surface.
 async fn exec_poll(conn: &mut Connection) -> io::Result<Result<RigState, RigError>> {
     let freq = match exec_get_freq(conn).await? {
         Ok(v) => v,
@@ -524,11 +504,8 @@ async fn exec_set_mode(
     mode: HamlibMode,
 ) -> io::Result<Result<(), RigError>> {
     let mode_str = mode.as_str();
-    // Passband -1 == RIG_PASSBAND_NOCHANGE in hamlib: change the mode
-    // but leave the rig's current DSP filter width alone. Sending `0`
-    // (RIG_PASSBAND_NORMAL) makes the backend apply the rig's default
-    // passband for the new mode, which clobbers a user's tuned filter
-    // every click-to-tune (e.g. FT-710 snapping back to 2400 Hz USB).
+    // Passband -1 = RIG_PASSBAND_NOCHANGE: preserves the user's DSP
+    // filter width. 0 (RIG_PASSBAND_NORMAL) would reset it each tune.
     conn.send(&format!("M {mode_str} -1")).await?;
     let line = conn.read_line().await?;
     Ok(parse_set_response(line))

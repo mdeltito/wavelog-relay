@@ -142,11 +142,21 @@ async fn radio_worker(
                     );
                     continue;
                 }
+                let kind = deduper.classify(&state);
                 tokio::select! {
                     push_res = client.push_radio(&radio, &state, power_max_watts) => {
                         match push_res {
-                            Ok(()) => deduper.record(&state, now),
-                            Err(e) => tracing::warn!(error = %e, "wavelog push failed"),
+                            Ok(()) => {
+                                log_radio_push(kind, &radio, &state, power_max_watts);
+                                deduper.record(&state, now);
+                            }
+                            Err(e) => tracing::warn!(
+                                error = %e,
+                                radio = %radio,
+                                freq = state.freq,
+                                mode = %state.mode,
+                                "wavelog push failed",
+                            ),
                         }
                     }
                     res = shutdown.changed() => {
@@ -188,6 +198,53 @@ struct DedupeKey {
     rfpower_q: Option<i32>,
 }
 
+/// Reason the current state passed the dedupe gate. Drives the log
+/// message emitted on a successful push so an operator can tell
+/// at-a-glance whether a wavelog POST was driven by VFO activity or by
+/// the periodic heartbeat refresh.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PushKind {
+    /// First push of the session.
+    Initial,
+    /// Frequency or mode differs from the last pushed key — a real QSY.
+    Change,
+    /// Same freq+mode, different quantized RFPOWER bin.
+    Power,
+    /// Identical state, but the heartbeat window expired.
+    Heartbeat,
+}
+
+impl PushKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Initial => "initial",
+            Self::Change => "change",
+            Self::Power => "power",
+            Self::Heartbeat => "heartbeat",
+        }
+    }
+}
+
+fn log_radio_push(kind: PushKind, radio: &str, state: &RigState, power_max_watts: f32) {
+    match state.power {
+        Some(p) => tracing::info!(
+            radio,
+            freq = state.freq,
+            mode = %state.mode,
+            power_watts = p * power_max_watts,
+            kind = kind.as_str(),
+            "wavelog radio state pushed",
+        ),
+        None => tracing::info!(
+            radio,
+            freq = state.freq,
+            mode = %state.mode,
+            kind = kind.as_str(),
+            "wavelog radio state pushed",
+        ),
+    }
+}
+
 impl Deduper {
     fn should_skip(&self, state: &RigState, now: Instant) -> bool {
         let (Some(last), Some(last_at)) = (&self.last, self.last_at) else {
@@ -206,6 +263,24 @@ impl Deduper {
             rfpower_q: state.power.map(quantize_rfpower),
         });
         self.last_at = Some(now);
+    }
+
+    /// Classify why a state passes the dedupe gate. Called immediately
+    /// before a push (after `should_skip` returned false), so by
+    /// construction at least one branch other than `Heartbeat` applies
+    /// whenever `last` is set — except in the case where only the
+    /// heartbeat window's expiry tripped the gate.
+    fn classify(&self, state: &RigState) -> PushKind {
+        let Some(last) = &self.last else {
+            return PushKind::Initial;
+        };
+        if last.freq != state.freq || *last.mode != *state.mode {
+            return PushKind::Change;
+        }
+        if last.rfpower_q != state.power.map(quantize_rfpower) {
+            return PushKind::Power;
+        }
+        PushKind::Heartbeat
     }
 }
 

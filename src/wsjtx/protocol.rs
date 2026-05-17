@@ -35,10 +35,6 @@ pub(super) fn parse_logged_adif(bytes: &[u8]) -> Result<Option<Box<str>>, WsjtxE
             format!("bad magic: 0x{magic:08x}").into(),
         ));
     }
-    // schema_version is read for the side effect of validating it
-    // exists but we don't gate on a specific version — WSJT-X has only
-    // ever appended fields to existing message types, so the prefix
-    // we read for type 12 is stable across schemas.
     let _schema = c.read_u32()?;
     let message_type = c.read_u32()?;
     if message_type != MSG_TYPE_LOGGED_ADIF {
@@ -48,6 +44,67 @@ pub(super) fn parse_logged_adif(bytes: &[u8]) -> Result<Option<Box<str>>, WsjtxE
     let _id = c.read_qstring()?;
     let adif = c.read_qstring()?;
     Ok(Some(adif))
+}
+
+/// Best-effort ADIF inspector for log lines. Missing fields yield `None`.
+#[derive(Debug, Default)]
+pub(super) struct AdifSummary {
+    callsign: Option<Box<str>>,
+    mode: Option<Box<str>>,
+    band: Option<Box<str>>,
+}
+
+impl AdifSummary {
+    pub(super) fn callsign(&self) -> &str {
+        self.callsign.as_deref().unwrap_or("?")
+    }
+    pub(super) fn mode(&self) -> &str {
+        self.mode.as_deref().unwrap_or("?")
+    }
+    pub(super) fn band(&self) -> &str {
+        self.band.as_deref().unwrap_or("?")
+    }
+}
+
+pub(super) fn summarize_adif(adif: &str) -> AdifSummary {
+    AdifSummary {
+        callsign: adif_field(adif, "CALL").map(Into::into),
+        mode: adif_field(adif, "MODE").map(Into::into),
+        band: adif_field(adif, "BAND").map(Into::into),
+    }
+}
+
+/// Locate an ADIF field's value by tag (case-insensitive). Sentinel
+/// tags (`<EOR>`, `<EOH>`) have no length and are skipped.
+fn adif_field<'a>(adif: &'a str, name: &str) -> Option<&'a str> {
+    let mut cursor = 0;
+    while let Some(off) = adif[cursor..].find('<') {
+        let header_start = cursor + off + 1;
+        let close = adif[header_start..].find('>')?;
+        let header_end = header_start + close;
+        let header = &adif[header_start..header_end];
+        let mut parts = header.split(':');
+        let tag = parts.next().unwrap_or("");
+        let Some(len_str) = parts.next() else {
+            // No length present (e.g. <EOR>, <EOH>): skip and continue.
+            cursor = header_end + 1;
+            continue;
+        };
+        let Ok(len) = len_str.parse::<usize>() else {
+            cursor = header_end + 1;
+            continue;
+        };
+        let value_start = header_end + 1;
+        let value_end = value_start.checked_add(len)?;
+        if value_end > adif.len() {
+            return None;
+        }
+        if tag.eq_ignore_ascii_case(name) {
+            return Some(&adif[value_start..value_end]);
+        }
+        cursor = value_end;
+    }
+    None
 }
 
 struct Cursor<'a> {
@@ -65,9 +122,7 @@ impl<'a> Cursor<'a> {
         Ok(u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
     }
 
-    /// Read a Qt-encoded `QString`: signed `qint32` byte-length (big-
-    /// endian) followed by UTF-8 bytes. A length of `-1` is "null" and
-    /// resolves to an empty string.
+    /// Qt `QString`: big-endian `qint32` length, then UTF-8. `-1` is null (empty).
     fn read_qstring(&mut self) -> Result<Box<str>, WsjtxError> {
         let len = self.read_u32()? as i32;
         if len < 0 {
@@ -100,15 +155,11 @@ impl<'a> Cursor<'a> {
     }
 }
 
-/// Test-only packet builders. `pub(super)` so the integration tests in
-/// `wsjtx/mod.rs` can reuse the same byte layout the protocol parser
-/// validates against.
+/// `pub(super)` packet builders shared with integration tests.
 #[cfg(test)]
 pub(super) mod test_packets {
     use super::{MAGIC, MSG_TYPE_LOGGED_ADIF};
 
-    /// Encode a Qt `QString` into a buffer: signed `qint32` big-endian
-    /// length, then UTF-8 bytes.
     pub fn push_qstring(out: &mut Vec<u8>, s: &str) {
         let len = s.len() as i32;
         out.extend_from_slice(&len.to_be_bytes());
@@ -187,6 +238,48 @@ mod tests {
             matches!(err, WsjtxError::Parse(ref msg) if msg.contains("UTF-8")),
             "got {err:?}",
         );
+    }
+
+    #[test]
+    fn adif_summary_extracts_known_fields() {
+        let adif = "<CALL:5>VK3AB <MODE:3>FT8 <BAND:3>20M <FREQ:8>14.07400 <EOR>";
+        let s = summarize_adif(adif);
+        assert_eq!(s.callsign(), "VK3AB");
+        assert_eq!(s.mode(), "FT8");
+        assert_eq!(s.band(), "20M");
+    }
+
+    #[test]
+    fn adif_summary_returns_placeholder_for_missing_fields() {
+        let s = summarize_adif("<EOR>");
+        assert_eq!(s.callsign(), "?");
+        assert_eq!(s.mode(), "?");
+        assert_eq!(s.band(), "?");
+    }
+
+    #[test]
+    fn adif_summary_is_case_insensitive_on_tag_names() {
+        let adif = "<call:5>VK3AB <Mode:3>FT8 <eor>";
+        let s = summarize_adif(adif);
+        assert_eq!(s.callsign(), "VK3AB");
+        assert_eq!(s.mode(), "FT8");
+    }
+
+    #[test]
+    fn adif_summary_handles_data_type_suffix() {
+        // ADIF lets fields carry an optional type suffix: <FREQ:8:N>...
+        // The leading length must still apply; the type code is ignored.
+        let adif = "<CALL:5:S>VK3AB <FREQ:8:N>14.07400 <EOR>";
+        let s = summarize_adif(adif);
+        assert_eq!(s.callsign(), "VK3AB");
+    }
+
+    #[test]
+    fn adif_summary_skips_sentinel_tags_without_aborting() {
+        // <EOH> appears before any field; must not stop the scan.
+        let adif = "<EOH><CALL:5>VK3AB <EOR>";
+        let s = summarize_adif(adif);
+        assert_eq!(s.callsign(), "VK3AB");
     }
 
     #[test]

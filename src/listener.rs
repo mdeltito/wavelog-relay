@@ -44,10 +44,7 @@ pub enum ListenerError {
     Serve(#[source] io::Error),
 }
 
-/// Serve the click-to-tune route on a pre-bound TCP listener until
-/// `shutdown` resolves to `true` (or its sender drops). The caller is
-/// responsible for the bind so port-in-use errors surface synchronously
-/// at startup.
+/// Serve click-to-tune on a pre-bound listener until `shutdown` fires.
 pub async fn serve(
     tcp_listener: TcpListener,
     rig: RigHandle,
@@ -73,15 +70,6 @@ fn build_router(rig: RigHandle, allow_origin: HeaderValue, overrides: ModeOverri
         overrides,
         allow_origin: allow_origin.clone(),
     };
-    // Predicate (not `AllowOrigin::exact`) so the listener only
-    // advertises Access-Control-Allow-Origin when the request actually
-    // came from the configured origin — `exact` would echo the
-    // configured origin back even for unrelated requests.
-    // Wavelog's current frontend issues a simple CORS GET (no
-    // preflight). Advertising OPTIONS is a one-line defence against
-    // future frontend changes that might add a header which forces a
-    // preflight — without it the layer would refuse OPTIONS at the
-    // CORS check rather than producing a usable preflight reply.
     let cors = CorsLayer::new()
         .allow_origin(AllowOrigin::predicate(move |origin, _parts| {
             *origin == allow_origin
@@ -105,11 +93,8 @@ async fn tune(
     headers: HeaderMap,
     Path((freq_segment, mode_segment)): Path<(String, String)>,
 ) -> Response {
-    // CSRF guard: any request that carries an Origin header must match
-    // the configured Wavelog origin. Requests with no Origin (curl from
-    // the host, scripts) are allowed through — browsers always set
-    // Origin on cross-origin fetch, so this rejects every malicious-
-    // page path while preserving local tooling.
+    // CSRF guard: reject when present-but-mismatched. Browsers always
+    // set Origin on cross-origin fetch; absent = local tooling.
     if let Some(origin) = headers.get(header::ORIGIN)
         && origin != state.allow_origin
     {
@@ -137,7 +122,12 @@ async fn tune(
         return StatusCode::BAD_GATEWAY.into_response();
     }
 
-    tracing::info!(freq, mode = hamlib.as_str(), "click-to-tune");
+    tracing::info!(
+        freq,
+        wavelog_mode = %mode_segment,
+        rig_mode = hamlib.as_str(),
+        "click-to-tune dispatched",
+    );
     (StatusCode::OK, Body::empty()).into_response()
 }
 

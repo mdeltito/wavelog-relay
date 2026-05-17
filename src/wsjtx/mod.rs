@@ -26,7 +26,7 @@ use std::sync::Arc;
 
 pub use bind::bind;
 pub use protocol::WsjtxError;
-use protocol::parse_logged_adif;
+use protocol::{parse_logged_adif, summarize_adif};
 use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
@@ -36,9 +36,6 @@ use crate::util::shutdown_observed;
 use crate::wavelog::{WavelogClient, WavelogError};
 
 const QUEUE_CAPACITY: usize = 32;
-// UDP max datagram size; WSJT-X messages are typically <1 KB, but a
-// fixed full-size buffer is the simplest correct allocation for
-// reusing across recv_from calls.
 const RECV_BUF_SIZE: usize = 65_535;
 
 /// Spawn the WSJT-X listener and POST worker.
@@ -72,7 +69,14 @@ pub fn spawn(
     shutdown: watch::Receiver<bool>,
 ) -> (JoinHandle<()>, JoinHandle<()>) {
     let (tx, rx) = mpsc::channel::<QueueItem>(QUEUE_CAPACITY);
-    let listener = tokio::spawn(listen(socket, tx, queue.clone(), replay, shutdown.clone()));
+    let listener = tokio::spawn(listen(
+        socket,
+        tx,
+        queue.clone(),
+        replay,
+        station_id.clone(),
+        shutdown.clone(),
+    ));
     let worker = tokio::spawn(post_loop(rx, client, station_id, queue, shutdown));
     (listener, worker)
 }
@@ -92,22 +96,23 @@ async fn listen(
     tx: mpsc::Sender<QueueItem>,
     queue: Option<Arc<QsoQueue>>,
     replay: Vec<(u64, Box<str>)>,
+    station_id: Box<str>,
     mut shutdown: watch::Receiver<bool>,
 ) {
     if let Ok(addr) = socket.local_addr() {
-        tracing::info!(addr = %addr, "wsjtx listener serving");
+        tracing::info!(
+            addr = %addr,
+            station_id = %station_id,
+            replay_count = replay.len(),
+            "wsjtx listener serving",
+        );
     }
     if *shutdown.borrow_and_update() {
         return;
     }
 
-    // Prime the worker with replay entries before pulling any new
-    // datagrams off the socket. send().await back-pressures on a full
-    // channel so a deep replay (longer than QUEUE_CAPACITY) is fully
-    // delivered to the worker rather than silently dropped. New
-    // datagrams sit in the kernel UDP buffer until the recv loop
-    // starts; in practice the priming completes in milliseconds even
-    // for a maxed-out queue.
+    // Prime the worker with replay entries before the recv loop starts.
+    // send().await back-pressures so a replay deeper than QUEUE_CAPACITY drains fully.
     for (seq, adif) in replay {
         tokio::select! {
             res = tx.send(QueueItem { seq: Some(seq), adif }) => {
@@ -138,17 +143,19 @@ async fn listen(
                 };
                 match parse_logged_adif(&buf[..n]) {
                     Ok(Some(adif)) => {
-                        tracing::debug!(
+                        let summary = summarize_adif(&adif);
+                        tracing::info!(
                             from = %from,
+                            callsign = summary.callsign(),
+                            mode = summary.mode(),
+                            band = summary.band(),
                             adif_len = adif.len(),
-                            "wsjtx logged ADIF received",
+                            "wsjtx QSO received",
                         );
                         let item = match &queue {
                             Some(q) => {
-                                // Persist BEFORE handing off so a
-                                // crash between accept and POST
-                                // doesn't lose the QSO. Cloning the
-                                // ADIF is cheap (typically <1 KB).
+                                // Persist before handoff so a crash between accept and POST
+                                // doesn't lose the QSO.
                                 match q.append(adif.clone()).await {
                                     Ok(seq) => QueueItem { seq: Some(seq), adif },
                                     Err(e) => {
@@ -208,14 +215,10 @@ async fn post_loop(
         tokio::select! {
             item = rx.recv() => match item {
                 Some(item) => {
-                    // Inner select makes the in-flight POST cancellable.
-                    // Without it, a Wavelog outage holds the shutdown
-                    // signal for up to ~15s ([0,1,4]s sleeps × 5s
-                    // timeout) — longer than systemd's default
-                    // TimeoutStopSec patience.
+                    // Inner select cancels the in-flight POST on shutdown.
                     tokio::select! {
                         push_res = client.push_qso(&station_id, &item.adif) => {
-                            handle_post_outcome(push_res, item.seq, queue.as_deref()).await;
+                            handle_post_outcome(push_res, &item, queue.as_deref()).await;
                         },
                         result = shutdown.changed() => {
                             if shutdown_observed(result, &shutdown) {
@@ -239,26 +242,49 @@ async fn post_loop(
 
 async fn handle_post_outcome(
     res: Result<(), WavelogError>,
-    seq: Option<u64>,
+    item: &QueueItem,
     queue: Option<&QsoQueue>,
 ) {
+    let summary = summarize_adif(&item.adif);
+    let callsign = summary.callsign();
+    let mode = summary.mode();
+    let band = summary.band();
     match res {
         Ok(()) => {
-            tracing::info!("wsjtx QSO logged to wavelog");
-            remove_persisted(seq, queue, "completed").await;
+            tracing::info!(
+                callsign,
+                mode,
+                band,
+                seq = item.seq,
+                "wsjtx QSO logged to wavelog",
+            );
+            remove_persisted(item.seq, queue, "completed").await;
         },
         Err(WavelogError::Rejected { ref reason }) => {
             // Wavelog answered cleanly with a permanent "no" (duplicate,
             // validation error, etc). Retrying will produce the same
             // answer; drop the entry from disk too.
-            tracing::warn!(reason = %reason, "wsjtx QSO rejected by wavelog");
-            remove_persisted(seq, queue, "rejected").await;
+            tracing::warn!(
+                reason = %reason,
+                callsign,
+                mode,
+                band,
+                "wsjtx QSO rejected by wavelog",
+            );
+            remove_persisted(item.seq, queue, "rejected").await;
         },
         Err(e) => {
             // Transport / 5xx / 4xx / BadResponse — keep on disk so
             // the next startup (or a future outage-recovery pass)
             // gets another shot.
-            tracing::warn!(error = %e, "wsjtx QSO POST failed; entry retained on disk for retry");
+            tracing::warn!(
+                error = %e,
+                callsign,
+                mode,
+                band,
+                seq = item.seq,
+                "wsjtx QSO POST failed; entry retained on disk for retry",
+            );
         },
     }
 }

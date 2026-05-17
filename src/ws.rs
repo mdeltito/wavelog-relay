@@ -173,6 +173,17 @@ struct AppState {
     shutdown: watch::Receiver<bool>,
 }
 
+/// Logs a `disconnected` info on drop. Used inside `handle_connection`
+/// so every exit path — clean close, lag drop, shutdown, socket error —
+/// produces a matching pair to the connect log.
+struct ConnectionGuard;
+
+impl Drop for ConnectionGuard {
+    fn drop(&mut self) {
+        tracing::info!("ws bandmap client disconnected");
+    }
+}
+
 async fn ws_upgrade(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -186,9 +197,9 @@ async fn ws_upgrade(
     // state.
     let origin = headers.get(header::ORIGIN);
     if origin != Some(&state.allow_origin) {
-        tracing::debug!(
+        tracing::warn!(
             ?origin,
-            "ws bandmap: rejecting handshake with mismatched origin"
+            "ws bandmap: rejecting handshake with mismatched origin",
         );
         return StatusCode::FORBIDDEN.into_response();
     }
@@ -217,6 +228,9 @@ async fn handle_connection(
     {
         return;
     }
+
+    tracing::info!("ws bandmap client connected");
+    let _guard = ConnectionGuard;
 
     loop {
         tokio::select! {
