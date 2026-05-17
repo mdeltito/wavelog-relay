@@ -44,9 +44,5 @@ panic = "abort"
 [package.metadata.release]
 publish = false
 allow-branch = ["main"]
-tag-name = "v{{version}}"
 tag-message = "wavelog-relay {{version}}"
 pre-release-commit-message = "chore: release v{{version}}"
-sign-commit = false
-sign-tag = false
-dev-version = false
