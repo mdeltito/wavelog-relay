@@ -76,7 +76,7 @@ fn build_router(rig: RigHandle, allow_origin: HeaderValue, overrides: ModeOverri
         }))
         .allow_methods([Method::GET, Method::OPTIONS]);
     Router::new()
-        .route("/:freq/:mode", get(tune))
+        .route("/{freq}/{mode}", get(tune))
         .layer(cors)
         .with_state(state)
 }
