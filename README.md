@@ -51,7 +51,7 @@ Every flag also reads `WAVELOG_BRIDGE_<UPPERCASE>` from the environment:
 | `--ws-listen <ADDR>` | `127.0.0.1:54322` | WebSocket bandmap bind. Wavelog's frontend hardcodes this port — only change it if you're fronting the bridge with a reverse proxy |
 | `--no-ws` | _(off)_ | Disable the WebSocket bandmap server. Frontend falls back to its 3 s AJAX poll |
 | `--wsjtx` | _(off)_ | Enable the WSJT-X UDP listener for forwarding logged QSOs to Wavelog. Requires `--station-id` |
-| `--wsjtx-listen <ADDR>` | `127.0.0.1:2237` | WSJT-X UDP listener bind (honored only with `--wsjtx`). Must match WSJT-X's `Settings → Reporting → UDP Server` |
+| `--wsjtx-listen <ADDR>` | `127.0.0.1:2237` | WSJT-X UDP listener bind (honored only with `--wsjtx`). Must match WSJT-X's `Settings → Reporting → UDP Server` *and* its delivery model — unicast (`127.0.0.1`) or multicast (`224.0.0.1`). See [WSJT-X QSO forwarding](#wsjt-x-qso-forwarding) |
 | `--station-id <ID>` | _(required if `--wsjtx`)_ | Wavelog station profile ID for QSO submissions. Run `wavelog-bridge stations` to look up IDs |
 | `--qso-queue-path <PATH>` | `$XDG_STATE_HOME/wavelog-bridge/qso_queue.jsonl` | On-disk JSONL spool for WSJT-X QSOs awaiting Wavelog. Created if absent. See "Persistent QSO queue" below |
 | `--interval <DUR>` | `1s` | Humantime: `1s`, `500ms`, etc. |
@@ -171,19 +171,9 @@ The frontend will also send messages back over the socket (`qso_logged`, `satell
 
 **Off by default.** Pass `--wsjtx` (or set `WAVELOG_BRIDGE_WSJTX=1`, or `wsjtx = true` in TOML) to enable.
 
-WSJT-X (and forks JTDX / MSHV) broadcast every logged QSO over UDP as a binary "network message". With `--wsjtx` set, wavelog-bridge listens on `udp://127.0.0.1:2237`, parses the `Logged ADIF` (type 12) message, and POSTs the ADIF string to Wavelog's `/api/qso` endpoint — completing a QSO in WSJT-X's Log QSO dialog appears in Wavelog within a second, no manual entry.
+WSJT-X (and forks JTDX / MSHV) broadcast every logged QSO over UDP as a binary "network message". With `--wsjtx` set, wavelog-bridge parses the `Logged ADIF` (type 12) message and POSTs the ADIF string to Wavelog's `/api/qso` endpoint — completing a QSO in WSJT-X's Log QSO dialog appears in Wavelog within a second, no manual entry. JTDX and MSHV speak the same protocol; the configuration is identical.
 
-**WSJT-X setup**: open **Settings → Reporting → UDP Server**.
-
-| Field | Value |
-|---|---|
-| UDP Server | `127.0.0.1` |
-| UDP Server port number | `2237` |
-| Accept UDP requests | (optional, no effect on us) |
-
-If you run JTDX or MSHV, the menu path and field names are the same — they speak the identical protocol.
-
-**Station profile ID**: Wavelog's `/api/qso` requires a `station_profile_id`. The daemon will not start with `--wsjtx` unless `--station-id` is set. Run the `stations` subcommand once to look it up:
+**Station profile ID first.** Wavelog's `/api/qso` requires a `station_profile_id`, and the daemon refuses to start with `--wsjtx` unless `--station-id` is set. Look yours up once:
 
 ```sh
 wavelog-bridge stations
@@ -193,30 +183,74 @@ wavelog-bridge stations
 #  2  Portable  K1AB/P
 ```
 
-The `stations` subcommand is a one-shot — it hits `/api/station_info`, prints a table, and exits. Same `--wavelog-url` / `--key-file` / `WAVELOG_BRIDGE_KEY` resolution as the daemon.
+The `stations` subcommand is one-shot — it hits `/api/station_info`, prints the table, and exits. Same `--wavelog-url` / `--key-file` / `WAVELOG_BRIDGE_KEY` resolution as the daemon.
 
-### Coexisting with GridTracker2 / JTAlert / other UDP consumers
+### Pick a delivery model
 
-WSJT-X has **one** "UDP Server" destination — only one process can claim `127.0.0.1:2237` at a time. If you already run GridTracker2, JTAlert, or similar, both you and they want the WSJT-X feed. Three ways to arrange that:
+WSJT-X has exactly one "UDP Server" destination. That destination is either a **unicast** address (delivered to one socket) or a **multicast** group (delivered to every subscribed socket). wavelog-bridge's `--wsjtx-listen` must match WSJT-X's delivery model — point them at different models and you'll see no QSOs at all, silently. Pick based on what else is on the host:
 
-**A — GridTracker2's built-in forwarder (recommended if you already use GT2).** Leave WSJT-X pointing at GridTracker2 (`127.0.0.1:2237`) as you do today. In GridTracker2: **Settings → Forwarding → Add Forwarder**, point it at a free port like `127.0.0.1:2238`. Then run wavelog-bridge with `--wsjtx-listen 127.0.0.1:2238`. GT2 receives, processes, and forwards an unmodified copy of every packet to us.
+- **Solo (only wavelog-bridge consumes the WSJT-X feed)** → use unicast `127.0.0.1:2237`. Both ends default to this; nothing to configure.
+- **Shared with GridTracker2 / JTAlert / log4om / anything else** → use multicast `224.0.0.1:2237`. Every consumer that subscribes to the group gets a copy; no forwarders, no port-stealing.
+
+### Solo setup (no other UDP consumers)
+
+WSJT-X **Settings → Reporting → UDP Server**:
+
+| Field | Value |
+|---|---|
+| UDP Server | `127.0.0.1` |
+| UDP Server port number | `2237` |
+| Accept UDP requests | (no effect on us) |
+
+Then run wavelog-bridge with the defaults — `--wsjtx-listen` is already `127.0.0.1:2237`:
+
+```sh
+wavelog-bridge ... --wsjtx --station-id 1
+```
+
+### Sharing the feed with GridTracker2 / JTAlert (recommended: multicast)
+
+WSJT-X **Settings → Reporting → UDP Server**:
+
+| Field | Value |
+|---|---|
+| UDP Server | `224.0.0.1` |
+| UDP Server port number | `2237` |
+| Outgoing interfaces | leave default unless you know you need a specific NIC |
+
+wavelog-bridge:
+
+```sh
+wavelog-bridge ... --wsjtx --wsjtx-listen 224.0.0.1:2237 --station-id 1
+```
+
+GridTracker2: **Settings → Logging → WSJT-X UDP** → set the address to `224.0.0.1`, port `2237`, and tick **Multicast**. JTAlert and log4om expose equivalent multicast toggles in their WSJT-X integration panels.
+
+That's it — every subscriber on `224.0.0.1:2237` receives every datagram. The pipeline becomes pub/sub: add or remove consumers without touching the others. Any group address in the `224.0.0.0/4` range works; `224.0.0.1` (the all-hosts group) is the convention WSJT-X documentation uses.
+
+#### GridTracker2 forwarder (fallback when you can't change WSJT-X's config)
+
+If you can't reconfigure WSJT-X's UDP Server (shared rig, locked-down install), use GT2 as a unicast forwarder instead. Leave WSJT-X pointing at `127.0.0.1:2237` (where GT2 already listens). In GridTracker2: **Settings → Forwarding → Add Forwarder**, point it at a free port — say `127.0.0.1:2238`. Then:
 
 ```sh
 wavelog-bridge ... --wsjtx --wsjtx-listen 127.0.0.1:2238 --station-id 1
 ```
 
-**B — Multicast (cleanest at scale, no forwarders).** Configure WSJT-X to broadcast to `224.0.0.1:2237` (any 224.x.x.x address works); GridTracker2, wavelog-bridge, JTAlert, and anything else can all subscribe at once. wavelog-bridge detects a multicast address in `--wsjtx-listen` and configures `SO_REUSEADDR`/`SO_REUSEPORT` + the group join automatically.
+GT2 receives, processes, and forwards an unmodified copy to us. Downside vs. multicast: GT2 becomes a single point of failure for our log path — if GT2 isn't running, QSOs don't reach wavelog-bridge.
 
-```sh
-# In WSJT-X: Settings → Reporting → UDP Server = 224.0.0.1, port 2237
-wavelog-bridge ... --wsjtx --wsjtx-listen 224.0.0.1:2237 --station-id 1
-```
+### Troubleshooting "WSJT-X sends but wavelog-bridge logs nothing"
 
-GridTracker2 supports listening on multicast too; check their docs to point it at the same group. The whole pipeline becomes pub/sub instead of point-to-point.
+The most common cause is a delivery-model mismatch — WSJT-X sending unicast while wavelog-bridge listens on multicast (or vice-versa). Quick checks:
 
-**C — Skip GridTracker2 / replace it.** If you're not using GT2's waterfall/map features, just point WSJT-X straight at wavelog-bridge on `127.0.0.1:2237` (the default).
+- **WSJT-X log window**: it logs every UDP send with the destination address. Confirm it matches `--wsjtx-listen` *exactly* (including unicast vs. group address).
+- **Who holds the port** (Linux): `ss -ulnp | grep 2237`. With multicast you should see wavelog-bridge bound to `224.0.0.1:2237`; with unicast, `127.0.0.1:2237`. If something else is bound to the unicast port, that process is the one receiving — not us.
+- **wavelog-bridge debug log**: `--log-level debug` prints `wsjtx logged ADIF received` (or `non-LoggedADIF message ignored` for heartbeats/status) for every datagram. Silence here means nothing is arriving at the socket.
 
-**Note about WavelogGate**: WavelogGate listens on port `2333` for a *different* WSJT-X feed (the "N1MM Logger+" plaintext output, configured separately in WSJT-X's Reporting tab). If you've been running WavelogGate + GridTracker2 together, that's how — they're on different ports reading different feeds. wavelog-bridge uses the primary binary UDP feed (port 2237 by default), so the WavelogGate-on-2333 / GT2-on-2237 split doesn't apply.
+A trap to know about: an earlier multicast bind used a wildcard (`0.0.0.0`) socket, which *also* received unicast traffic to any local IP on the same port. That made misconfigured "WSJT-X unicasts to `127.0.0.1` / wavelog-bridge listens on `224.0.0.1`" setups appear to work — right up until another consumer (e.g. GT2) bound the specific unicast address and silently stole the packets. The current Linux build binds the multicast group address directly, so a delivery-model mismatch fails immediately and consistently rather than intermittently. macOS still uses the wildcard bind — the BSD socket API doesn't allow binding a multicast address — so the trap still applies there. If a setup works on macOS and stops working when you migrate to Linux, a delivery-model mismatch is the first thing to check.
+
+### WavelogGate is a different feed
+
+WavelogGate listens on port `2333` for the **N1MM Logger+ plaintext** WSJT-X output, which is a separate Reporting tab from the binary UDP Server. wavelog-bridge consumes the binary feed (`2237`), so a WavelogGate-on-2333 + GT2-on-2237 setup doesn't conflict with us — they're three independent feeds in WSJT-X.
 
 ### Persistent QSO queue
 
