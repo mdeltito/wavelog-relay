@@ -32,9 +32,6 @@ const DEFAULT_POLL_INTERVAL: Duration = Duration::from_secs(1);
 const DEFAULT_RIG_TIMEOUT: Duration = Duration::from_secs(3);
 const DEFAULT_LOG_LEVEL: &str = "info";
 
-// All fields are `Option` so we can distinguish "user didn't supply"
-// from "user supplied this value"; merging with TOML and defaults
-// happens later in `Config::load`.
 #[derive(Debug, Default, Parser)]
 #[command(version, about = "Rust bridge between rigctld and Wavelog")]
 pub struct Cli {
@@ -49,8 +46,6 @@ pub struct Cli {
     pub rigctld: Option<Endpoint>,
 
     /// Wavelog base URL (e.g. https://wavelog.example.com/index.php).
-    /// Marked `global` so subcommands like `stations` can read it from
-    /// the same flag and the same TOML field.
     #[arg(long, env = "WAVELOG_BRIDGE_WAVELOG_URL", global = true)]
     pub wavelog_url: Option<String>,
 
@@ -58,8 +53,7 @@ pub struct Cli {
     #[arg(long, env = "WAVELOG_BRIDGE_RADIO")]
     pub radio: Option<String>,
 
-    /// Path to a file containing the Wavelog API key. `global` so the
-    /// `stations` subcommand can reuse it.
+    /// Path to a file containing the Wavelog API key.
     #[arg(long, env = "WAVELOG_BRIDGE_KEY_FILE", global = true)]
     pub key_file: Option<PathBuf>,
 
@@ -72,7 +66,7 @@ pub struct Cli {
     #[arg(long, env = "WAVELOG_BRIDGE_LISTEN")]
     pub listen: Option<SocketAddr>,
 
-    /// WebSocket bandmap bind address. The Wavelog frontend
+    /// WebSocket bind address. The Wavelog frontend
     /// (`assets/js/cat.js`) hardcodes a fallback to `ws://127.0.0.1:54322`,
     /// so changing this is only useful for local testing or to avoid
     /// a port conflict before fronting the bridge with a reverse proxy.
@@ -80,7 +74,7 @@ pub struct Cli {
     #[arg(long, env = "WAVELOG_BRIDGE_WS_LISTEN")]
     pub ws_listen: Option<SocketAddr>,
 
-    /// Disable the WebSocket bandmap server entirely (no bind on
+    /// Disable the WebSocket server entirely (no bind on
     /// `--ws-listen`). The Wavelog frontend will fall back to its 3 s
     /// AJAX poll for rig-card updates.
     #[arg(long, env = "WAVELOG_BRIDGE_NO_WS")]
@@ -126,7 +120,6 @@ pub struct Cli {
     pub rig_timeout: Option<Duration>,
 
     /// Optional TOML config file. Auto-discovered if not given.
-    /// `global` so the `stations` subcommand can pick the same file.
     #[arg(long, env = "WAVELOG_BRIDGE_CONFIG", global = true)]
     pub config: Option<PathBuf>,
 
@@ -337,22 +330,8 @@ impl Config {
                 .expect("hardcoded default valid")
         });
 
-        // `--no-ws` is a CLI bool: presence on the command line is
-        // enough to opt out. Fall through to TOML only when the flag
-        // wasn't passed.
-        let no_ws = if cli.no_ws {
-            true
-        } else {
-            toml.no_ws.unwrap_or(false)
-        };
-
-        // `--wsjtx` is opt-in (default off). CLI presence is enough;
-        // otherwise fall through to TOML.
-        let wsjtx = if cli.wsjtx {
-            true
-        } else {
-            toml.wsjtx.unwrap_or(false)
-        };
+        let no_ws = cli.no_ws || toml.no_ws.unwrap_or(false);
+        let wsjtx = cli.wsjtx || toml.wsjtx.unwrap_or(false);
 
         let wsjtx_listen_addr = cli.wsjtx_listen.or(toml.wsjtx_listen).unwrap_or_else(|| {
             DEFAULT_WSJTX_LISTEN_ADDR
@@ -432,12 +411,8 @@ fn default_config_path() -> Option<PathBuf> {
     Some(dir.join("wavelog-bridge").join("config.toml"))
 }
 
-/// Default path for the persistent QSO queue. Follows the XDG Base
-/// Directory spec: `$XDG_STATE_HOME/wavelog-bridge/qso_queue.jsonl`,
-/// falling back to `$HOME/.local/state/wavelog-bridge/qso_queue.jsonl`.
-/// If neither env var is set the file is placed under `./` — unusual
-/// in practice (systemd, login shells, even cron set HOME) but
-/// harmless for one-off invocations.
+/// XDG state path: `$XDG_STATE_HOME/wavelog-bridge/qso_queue.jsonl`
+/// (or `~/.local/state/wavelog-bridge/qso_queue.jsonl`).
 fn default_qso_queue_path() -> PathBuf {
     let dir = std::env::var_os("XDG_STATE_HOME")
         .map(PathBuf::from)

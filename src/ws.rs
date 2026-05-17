@@ -1,11 +1,12 @@
-//! WebSocket bandmap server for Wavelog's frontend.
+//! WebSocket server for Wavelog's frontend.
 //!
 //! Wavelog's `assets/js/cat.js` opens a WebSocket to
 //! `ws://127.0.0.1:54322` (after trying `wss://...:54323` first) and
-//! consumes `radio_status` frames to drive the live rig card. Without a
-//! server on either port the frontend falls back to a 3 s AJAX poll of
-//! `/api/radio` — usable but sluggish, especially while spinning the
-//! VFO.
+//! consumes `radio_status` frames to drive multiple live widgets —
+//! primarily the rig card on the dashboard, with the bandmap page as a
+//! secondary consumer. Without a server on either port the frontend
+//! falls back to a 3 s AJAX poll of `/api/radio` — usable but sluggish,
+//! especially while spinning the VFO.
 //!
 //! Scope (intentionally narrower than WaveLogGate):
 //!
@@ -18,10 +19,10 @@
 //!   tick (1 Hz), not deduped — the POST dedupe exists to spare Wavelog
 //!   DB writes; WS frames are cheap and the frontend wants live updates
 //!   while the VFO turns.
-//! - **Inbound messages are accepted and discarded.** Wavelog sends
-//!   `qso_logged` / `satellite_position` / `lookup_result` — forwarding
-//!   those (UDP to N1MM, az/el to rotctld, etc.) is a separate product
-//!   with its own config surface, not part of v1 bandmap.
+//! - **Inbound messages are accepted and discarded.** Wavelog's bandmap
+//!   page sends `qso_logged` / `satellite_position` / `lookup_result` —
+//!   forwarding those (UDP to N1MM, az/el to rotctld, etc.) is a
+//!   separate feature with its own config surface, deferred past v1.
 //! - **Origin check is strict.** The WS handshake has no CORS; the
 //!   server alone decides whether to accept it. We require the `Origin`
 //!   header to equal the configured Wavelog URL's origin.
@@ -48,16 +49,16 @@ const WELCOME_FRAME: &str = r#"{"type":"welcome"}"#;
 const INBOUND_LOG_TRUNC: usize = 120;
 
 #[derive(Debug, Error)]
-pub enum WsBandmapError {
+pub enum WsError {
     #[error("axum serve loop failed: {0}")]
     Serve(#[source] io::Error),
 }
 
 /// Cloneable broadcast handle. The poller produces one
-/// [`broadcast`](WsBandmapHandle::broadcast) call per tick; every
+/// [`broadcast`](WsHandle::broadcast) call per tick; every
 /// connected client receives the serialized `radio_status` frame.
 #[derive(Clone)]
-pub struct WsBandmapHandle {
+pub struct WsHandle {
     inner: Arc<HandleInner>,
 }
 
@@ -67,7 +68,7 @@ struct HandleInner {
     power_max_watts: f32,
 }
 
-impl WsBandmapHandle {
+impl WsHandle {
     pub fn new(radio: Box<str>, power_max_watts: f32) -> Self {
         let (tx, _rx) = broadcast::channel(CHANNEL_CAPACITY);
         Self {
@@ -95,12 +96,11 @@ impl WsBandmapHandle {
         let json = match serde_json::to_string(&frame) {
             Ok(s) => s,
             Err(e) => {
-                tracing::warn!(error = %e, "ws bandmap: serialize radio_status");
+                tracing::warn!(error = %e, "ws: serialize radio_status");
                 return;
             },
         };
-        // `send` returns Err only when there are zero subscribers — the
-        // normal idle state. Don't log on every tick.
+        // Err only when there are no subscribers (the idle case).
         let _ = self.inner.tx.send(Arc::from(json));
     }
 
@@ -131,30 +131,30 @@ struct RadioStatus<'a> {
     timestamp: u64,
 }
 
-/// Run the WebSocket bandmap server on a pre-bound TCP listener until
+/// Run the WebSocket server on a pre-bound TCP listener until
 /// `shutdown` resolves to `true` (or its sender drops). Pre-binding
 /// (same pattern as the HTTP listener) ensures `EADDRINUSE` on 54322
 /// surfaces synchronously at startup.
 pub async fn serve(
     tcp_listener: TcpListener,
-    handle: WsBandmapHandle,
+    handle: WsHandle,
     allow_origin: HeaderValue,
     shutdown: watch::Receiver<bool>,
-) -> Result<(), WsBandmapError> {
+) -> Result<(), WsError> {
     if let Ok(addr) = tcp_listener.local_addr() {
-        tracing::info!(addr = %addr, "ws bandmap serving");
+        tracing::info!(addr = %addr, "ws serving");
     }
     let app = build_router(handle, allow_origin, shutdown.clone());
     axum::serve(tcp_listener, app)
         .with_graceful_shutdown(wait_for_shutdown(shutdown))
         .await
-        .map_err(WsBandmapError::Serve)?;
-    tracing::info!("ws bandmap stopped");
+        .map_err(WsError::Serve)?;
+    tracing::info!("ws stopped");
     Ok(())
 }
 
 fn build_router(
-    handle: WsBandmapHandle,
+    handle: WsHandle,
     allow_origin: HeaderValue,
     shutdown: watch::Receiver<bool>,
 ) -> Router {
@@ -168,7 +168,7 @@ fn build_router(
 
 #[derive(Clone)]
 struct AppState {
-    handle: WsBandmapHandle,
+    handle: WsHandle,
     allow_origin: HeaderValue,
     shutdown: watch::Receiver<bool>,
 }
@@ -180,7 +180,7 @@ struct ConnectionGuard;
 
 impl Drop for ConnectionGuard {
     fn drop(&mut self) {
-        tracing::info!("ws bandmap client disconnected");
+        tracing::info!("ws client disconnected");
     }
 }
 
@@ -189,18 +189,11 @@ async fn ws_upgrade(
     headers: HeaderMap,
     ws: WebSocketUpgrade,
 ) -> Response {
-    // The WebSocket handshake doesn't go through tower-http's CORS
-    // layer — there's no preflight, and the browser sends the upgrade
-    // request as if it were same-origin. The server is solely
-    // responsible for vetting Origin; otherwise any HTTPS origin could
-    // open a connection to `ws://127.0.0.1:54322` and read live rig
-    // state.
+    // CORS doesn't apply to WS upgrades; server must vet Origin or any
+    // HTTPS origin could read live rig state.
     let origin = headers.get(header::ORIGIN);
     if origin != Some(&state.allow_origin) {
-        tracing::warn!(
-            ?origin,
-            "ws bandmap: rejecting handshake with mismatched origin",
-        );
+        tracing::warn!(?origin, "ws: rejecting handshake with mismatched origin",);
         return StatusCode::FORBIDDEN.into_response();
     }
     ws.on_upgrade(move |socket| handle_connection(socket, state.handle, state.shutdown))
@@ -208,10 +201,9 @@ async fn ws_upgrade(
 
 async fn handle_connection(
     mut socket: WebSocket,
-    handle: WsBandmapHandle,
+    handle: WsHandle,
     mut shutdown: watch::Receiver<bool>,
 ) {
-    // Already shutting down? Close cleanly before we wire anything up.
     if *shutdown.borrow_and_update() {
         let _ = socket.send(Message::Close(None)).await;
         return;
@@ -219,8 +211,6 @@ async fn handle_connection(
 
     let mut rx = handle.subscribe();
 
-    // Welcome is optional per the frontend (it `return`s on it), but
-    // sending it doubles as a smoke signal on `websocat`.
     if socket
         .send(Message::Text(WELCOME_FRAME.into()))
         .await
@@ -229,7 +219,7 @@ async fn handle_connection(
         return;
     }
 
-    tracing::info!("ws bandmap client connected");
+    tracing::info!("ws client connected");
     let _guard = ConnectionGuard;
 
     loop {
@@ -250,10 +240,8 @@ async fn handle_connection(
                     }
                 }
                 Err(broadcast::error::RecvError::Lagged(n)) => {
-                    // The frontend reconnects with progressive backoff,
-                    // so dropping is preferable to forwarding stale
-                    // state from before the lag window.
-                    tracing::warn!(skipped = n, "ws bandmap: subscriber lagged, dropping connection");
+                    // Drop on lag; frontend reconnects and stale state is worse than a gap.
+                    tracing::warn!(skipped = n, "ws: subscriber lagged, dropping connection");
                     let _ = socket.send(Message::Close(None)).await;
                     return;
                 }
@@ -264,17 +252,15 @@ async fn handle_connection(
                 Some(Ok(Message::Text(s))) => {
                     let s_ref: &str = s.as_ref();
                     let trunc: String = s_ref.chars().take(INBOUND_LOG_TRUNC).collect();
-                    tracing::debug!(text = %trunc, "ws bandmap: ignoring inbound text");
+                    tracing::debug!(text = %trunc, "ws: ignoring inbound text");
                 }
                 Some(Ok(Message::Binary(_))) => {
-                    tracing::debug!("ws bandmap: ignoring inbound binary frame");
+                    tracing::debug!("ws: ignoring inbound binary frame");
                 }
-                Some(Ok(Message::Ping(_) | Message::Pong(_))) => {
-                    // axum responds to Ping automatically.
-                }
+                Some(Ok(Message::Ping(_) | Message::Pong(_))) => {}
                 Some(Ok(Message::Close(_))) | None => return,
                 Some(Err(e)) => {
-                    tracing::debug!(error = %e, "ws bandmap: socket recv error, closing");
+                    tracing::debug!(error = %e, "ws: socket recv error, closing");
                     return;
                 }
             }
@@ -320,12 +306,9 @@ mod tests {
     /// Caller is responsible for keeping the returned `JoinHandle` alive
     /// so the task doesn't abort.
     async fn spawn_server(
-        handle: WsBandmapHandle,
+        handle: WsHandle,
         shutdown: watch::Receiver<bool>,
-    ) -> (
-        SocketAddr,
-        tokio::task::JoinHandle<Result<(), WsBandmapError>>,
-    ) {
+    ) -> (SocketAddr, tokio::task::JoinHandle<Result<(), WsError>>) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let join = tokio::spawn(serve(listener, handle, allow_origin(), shutdown));
@@ -346,7 +329,7 @@ mod tests {
 
     #[tokio::test]
     async fn rejects_handshake_with_mismatched_origin() {
-        let handle = WsBandmapHandle::new("FT-710".into(), 100.0);
+        let handle = WsHandle::new("FT-710".into(), 100.0);
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let (addr, _join) = spawn_server(handle, shutdown_rx).await;
 
@@ -365,7 +348,7 @@ mod tests {
 
     #[tokio::test]
     async fn rejects_handshake_without_origin_header() {
-        let handle = WsBandmapHandle::new("FT-710".into(), 100.0);
+        let handle = WsHandle::new("FT-710".into(), 100.0);
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let (addr, _join) = spawn_server(handle, shutdown_rx).await;
 
@@ -388,7 +371,7 @@ mod tests {
 
     #[tokio::test]
     async fn welcome_then_broadcast_is_received() {
-        let handle = WsBandmapHandle::new("FT-710".into(), 100.0);
+        let handle = WsHandle::new("FT-710".into(), 100.0);
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let (addr, _join) = spawn_server(handle.clone(), shutdown_rx).await;
 
@@ -442,7 +425,7 @@ mod tests {
 
     #[tokio::test]
     async fn broadcast_fans_out_to_multiple_subscribers() {
-        let handle = WsBandmapHandle::new("FT-710".into(), 100.0);
+        let handle = WsHandle::new("FT-710".into(), 100.0);
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let (addr, _join) = spawn_server(handle.clone(), shutdown_rx).await;
 
@@ -485,7 +468,7 @@ mod tests {
 
     #[tokio::test]
     async fn shutdown_signal_closes_connected_clients() {
-        let handle = WsBandmapHandle::new("FT-710".into(), 100.0);
+        let handle = WsHandle::new("FT-710".into(), 100.0);
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let (addr, join) = spawn_server(handle.clone(), shutdown_rx).await;
 
@@ -520,14 +503,14 @@ mod tests {
 
     #[test]
     fn broadcast_without_subscribers_is_a_noop() {
-        let handle = WsBandmapHandle::new("FT-710".into(), 100.0);
+        let handle = WsHandle::new("FT-710".into(), 100.0);
         // No subscribers — must not panic, not error visibly.
         handle.broadcast(&dummy_state());
     }
 
     #[tokio::test]
     async fn broadcast_omits_power_when_state_power_is_none() {
-        let handle = WsBandmapHandle::new("FT-710".into(), 100.0);
+        let handle = WsHandle::new("FT-710".into(), 100.0);
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let (addr, _join) = spawn_server(handle.clone(), shutdown_rx).await;
 

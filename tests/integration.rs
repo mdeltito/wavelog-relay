@@ -26,7 +26,7 @@ use tokio_tungstenite::tungstenite::protocol::Message as TungMessage;
 use wavelog_bridge::modes::ModeOverrides;
 use wavelog_bridge::qso_queue::QsoQueue;
 use wavelog_bridge::wavelog::WavelogClient;
-use wavelog_bridge::ws::WsBandmapHandle;
+use wavelog_bridge::ws::WsHandle;
 use wavelog_bridge::{listener, poller, rigctld, ws, wsjtx};
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -106,7 +106,7 @@ async fn full_round_trip_outbound_and_inbound() {
 
     let ws_tcp_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let ws_addr = ws_tcp_listener.local_addr().unwrap();
-    let ws_handle = WsBandmapHandle::new("FT-710".into(), 100.0);
+    let ws_handle = WsHandle::new("FT-710".into(), 100.0);
 
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
 

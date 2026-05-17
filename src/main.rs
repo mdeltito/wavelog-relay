@@ -7,7 +7,7 @@ use tracing_subscriber::EnvFilter;
 use wavelog_bridge::config::{Cli, Command, Config, StationsConfig};
 use wavelog_bridge::qso_queue::QsoQueue;
 use wavelog_bridge::wavelog::{Station, WavelogClient};
-use wavelog_bridge::ws::WsBandmapHandle;
+use wavelog_bridge::ws::WsHandle;
 use wavelog_bridge::{listener, poller, rigctld, ws, wsjtx};
 
 #[tokio::main]
@@ -21,8 +21,6 @@ async fn main() -> anyhow::Result<()> {
 
 async fn run_stations(cli: Cli) -> anyhow::Result<()> {
     let config = StationsConfig::load(&cli)?;
-    // Bare-bones tracing for one-shots so any error path still produces
-    // something readable on stderr.
     init_tracing("warn");
 
     let client = WavelogClient::new(&config.wavelog_url, &config.key)
@@ -42,8 +40,6 @@ async fn run_stations(cli: Cli) -> anyhow::Result<()> {
 }
 
 fn print_station_table(stations: &[Station]) {
-    // Compute column widths so the output stays aligned even with
-    // wide callsigns or names.
     let id_w = stations
         .iter()
         .map(|s| s.id.len())
@@ -97,9 +93,7 @@ async fn run_daemon(cli: Cli) -> anyhow::Result<()> {
         "wavelog-bridge starting"
     );
 
-    // Bind every listener socket up front so port conflicts surface
-    // synchronously and main can exit non-zero before any background
-    // tasks start.
+    // Bind all listeners up front so port conflicts exit non-zero before any task spawns.
     let tcp_listener = tokio::net::TcpListener::bind(config.listen_addr)
         .await
         .with_context(|| format!("failed to bind listener on {}", config.listen_addr))?;
@@ -111,7 +105,7 @@ async fn run_daemon(cli: Cli) -> anyhow::Result<()> {
             tokio::net::TcpListener::bind(config.ws_listen_addr)
                 .await
                 .with_context(|| {
-                    format!("failed to bind ws bandmap on {}", config.ws_listen_addr)
+                    format!("failed to bind ws server on {}", config.ws_listen_addr)
                 })?,
         )
     };
@@ -138,7 +132,7 @@ async fn run_daemon(cli: Cli) -> anyhow::Result<()> {
 
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
-    let ws_handle = WsBandmapHandle::new(config.radio.clone(), config.power_max_watts);
+    let ws_handle = WsHandle::new(config.radio.clone(), config.power_max_watts);
 
     let poller_task = tokio::spawn(poller::run(
         rig_handle.clone(),
@@ -167,10 +161,7 @@ async fn run_daemon(cli: Cli) -> anyhow::Result<()> {
         ))
     });
 
-    // station_id is guaranteed Some when config.wsjtx is true — the
-    // Config::merge check enforces it. Pair the socket with its
-    // station_id, open the persistent QSO queue (replaying any
-    // pending entries), and build the WSJT-X listener + worker.
+    // station_id is Some iff config.wsjtx (Config::merge enforces it).
     let wsjtx_tasks = match (wsjtx_socket, config.station_id) {
         (Some(socket), Some(station_id)) => {
             let (queue, replay) = QsoQueue::open(config.qso_queue_path.clone())
@@ -198,9 +189,8 @@ async fn run_daemon(cli: Cli) -> anyhow::Result<()> {
         _ => None,
     };
 
-    // Drop the originals — the spawned tasks already hold their clones.
-    // Keeping these alive would prevent the rig actor from exiting after
-    // shutdown, and the ws handle from dropping its broadcast sender.
+    // Tasks hold the clones; dropping these here lets the rig actor and
+    // WS broadcast sender shut down cleanly.
     drop(rig_handle);
     drop(ws_handle);
     drop(shutdown_rx);
@@ -220,8 +210,8 @@ async fn run_daemon(cli: Cli) -> anyhow::Result<()> {
     if let Some(task) = ws_task {
         match task.await {
             Ok(Ok(())) => {},
-            Ok(Err(e)) => tracing::error!(error = %e, "ws bandmap returned an error"),
-            Err(e) => tracing::error!(error = %e, "ws bandmap task panicked"),
+            Ok(Err(e)) => tracing::error!(error = %e, "ws server returned an error"),
+            Err(e) => tracing::error!(error = %e, "ws server task panicked"),
         }
     }
     if let Some((listener, worker)) = wsjtx_tasks {
@@ -233,8 +223,7 @@ async fn run_daemon(cli: Cli) -> anyhow::Result<()> {
         }
     }
 
-    // All RigHandle clones are now dropped; the actor will observe an
-    // empty channel and exit on its own.
+    // All RigHandle clones dropped; the actor exits on empty channel.
     let _ = rig_join.await;
 
     tracing::info!("shutdown complete");

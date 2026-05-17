@@ -3,7 +3,7 @@
 Rust bridge between rigctld and Wavelog. One static binary, both directions:
 
 - **Outbound (HTTP)**: polls rigctld at 1 Hz and pushes rig state (frequency, mode, power) to Wavelog's `/api/radio`.
-- **Outbound (WebSocket bandmap)**: serves `ws://127.0.0.1:54322` and broadcasts `radio_status` frames to Wavelog's bandmap client every tick, so the rig card and bandmap update live instead of on the 3 s AJAX poll.
+- **Outbound (WebSocket)**: serves `ws://127.0.0.1:54322` and broadcasts `radio_status` frames every tick, driving Wavelog's rig card on the dashboard and the bandmap page in real time instead of on the 3 s AJAX poll.
 - **Inbound (click-to-tune)**: listens on `127.0.0.1:54321` for Wavelog's click-to-tune callback and dispatches `F`/`M` commands to rigctld.
 - **Inbound (WSJT-X QSO log)**: opt-in via `--wsjtx`. When enabled, listens on `udp://127.0.0.1:2237` for WSJT-X's binary "network message" protocol and forwards each logged QSO (the `Logged ADIF` message) to Wavelog's `/api/qso`. Replaces WavelogGate's WSJT-X bridge.
 
@@ -48,8 +48,8 @@ Every flag also reads `WAVELOG_BRIDGE_<UPPERCASE>` from the environment:
 | `--key-file <PATH>` | _(see Secrets)_ | Path to file containing the API key |
 | `--power-max <W>` | `100` | Rig's max RF power, used to scale rigctld's `0.0..=1.0` RFPOWER reading |
 | `--listen <ADDR>` | `127.0.0.1:54321` | Click-to-tune listener bind |
-| `--ws-listen <ADDR>` | `127.0.0.1:54322` | WebSocket bandmap bind. Wavelog's frontend hardcodes this port — only change it if you're fronting the bridge with a reverse proxy |
-| `--no-ws` | _(off)_ | Disable the WebSocket bandmap server. Frontend falls back to its 3 s AJAX poll |
+| `--ws-listen <ADDR>` | `127.0.0.1:54322` | WebSocket bind. Wavelog's frontend hardcodes this port — only change it if you're fronting the bridge with a reverse proxy |
+| `--no-ws` | _(off)_ | Disable the WebSocket server. Frontend falls back to its 3 s AJAX poll |
 | `--wsjtx` | _(off)_ | Enable the WSJT-X UDP listener for forwarding logged QSOs to Wavelog. Requires `--station-id` |
 | `--wsjtx-listen <ADDR>` | `127.0.0.1:2237` | WSJT-X UDP listener bind (honored only with `--wsjtx`). Must match WSJT-X's `Settings → Reporting → UDP Server` *and* its delivery model — unicast (`127.0.0.1`) or multicast (`224.0.0.1`). See [WSJT-X QSO forwarding](#wsjt-x-qso-forwarding) |
 | `--station-id <ID>` | _(required if `--wsjtx`)_ | Wavelog station profile ID for QSO submissions. Run `wavelog-bridge stations` to look up IDs |
@@ -159,13 +159,13 @@ journalctl -u wavelog-bridge -f
 
 On `systemctl suspend` / wake, both rigctld and wavelog-bridge recover automatically — the actor's capped exponential backoff (`500 ms → 1 s → 2 s → 5 s → 10 s`) handles the rigctld side, and reqwest retries handle transient Wavelog failures.
 
-## WebSocket bandmap
+## WebSocket
 
-Wavelog's frontend (`assets/js/cat.js`) opens a WebSocket to the local machine for live `radio_status` updates: first `wss://127.0.0.1:54323`, then falling back to `ws://127.0.0.1:54322`. wavelog-bridge serves the **WS port only** (54322). The frontend's WSS attempt fails fast and the fallback connects within a second, so you'll see one extra connection attempt in devtools and nothing else.
+Wavelog's frontend (`assets/js/cat.js`) opens a WebSocket to the local machine for live `radio_status` updates: first `wss://127.0.0.1:54323`, then falling back to `ws://127.0.0.1:54322`. wavelog-bridge serves the **WS port only** (54322). The frontend's WSS attempt fails fast and the fallback connects within a second, so you'll see one extra connection attempt in devtools and nothing else. The same frames drive the dashboard rig card and the bandmap page; both stay live without the 3 s AJAX poll.
 
 Native WSS (54323) is deferred. If you need it today, terminate TLS in a reverse proxy and forward to `ws://127.0.0.1:54322`, or run with `--no-ws` and let the frontend fall back to its 3 s AJAX poll.
 
-The frontend will also send messages back over the socket (`qso_logged`, `satellite_position`, `lookup_result`) — wavelog-bridge accepts and discards these at debug log level. Forwarding to UDP (N1MM/JTDX) or rotctld is a future iteration with its own configuration.
+The frontend's bandmap page also sends messages back over the same socket (`qso_logged`, `satellite_position`, `lookup_result`) — wavelog-bridge accepts and discards these at debug log level. Forwarding to UDP (N1MM/JTDX) or rotctld is a future iteration with its own configuration.
 
 ## WSJT-X QSO forwarding
 
@@ -267,7 +267,7 @@ The file is capped at 1000 entries; the oldest are evicted with a WARN if you so
 
 ## Browsers (Safari note)
 
-Click-to-tune issues `fetch('http://127.0.0.1:54321/<hz>/<mode>')` from an HTTPS Wavelog page, and the bandmap client opens `ws://127.0.0.1:54322` — both are mixed content in the strict sense. Chromium and Firefox treat `127.0.0.1` as a potentially-trustworthy origin per the [Secure Contexts](https://w3c.github.io/webappsec-secure-contexts/) spec and allow both. Safari is stricter and may silently block them. If you're on Safari and either feature doesn't work, switch to Chromium/Firefox or put a TLS terminator in front of wavelog-bridge.
+Click-to-tune issues `fetch('http://127.0.0.1:54321/<hz>/<mode>')` from an HTTPS Wavelog page, and the frontend opens `ws://127.0.0.1:54322` for live rig status — both are mixed content in the strict sense. Chromium and Firefox treat `127.0.0.1` as a potentially-trustworthy origin per the [Secure Contexts](https://w3c.github.io/webappsec-secure-contexts/) spec and allow both. Safari is stricter and may silently block them. If you're on Safari and either feature doesn't work, switch to Chromium/Firefox or put a TLS terminator in front of wavelog-bridge.
 
 ## Verifying
 
@@ -292,7 +292,7 @@ curl -i http://127.0.0.1:54321/14074000/usb
 
 No `Access-Control-Allow-Origin` header on this — that's expected for a curl request without an `Origin` header. The rig should still retune.
 
-Manual WS bandmap smoke (replace `https://wavelog.example.com` with your configured origin — wavelog-bridge rejects mismatched `Origin` headers with `403`):
+Manual WS smoke (replace `https://wavelog.example.com` with your configured origin — wavelog-bridge rejects mismatched `Origin` headers with `403`):
 
 ```sh
 websocat ws://127.0.0.1:54322 -H 'Origin: https://wavelog.example.com'
