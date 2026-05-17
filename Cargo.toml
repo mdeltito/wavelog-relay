@@ -40,3 +40,13 @@ lto = "thin"
 codegen-units = 1
 strip = true
 panic = "abort"
+
+[package.metadata.release]
+publish = false
+allow-branch = ["main"]
+tag-name = "v{{version}}"
+tag-message = "wavelog-bridge {{version}}"
+pre-release-commit-message = "chore: release v{{version}}"
+sign-commit = false
+sign-tag = false
+dev-version = false

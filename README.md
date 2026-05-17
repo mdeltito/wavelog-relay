@@ -249,6 +249,27 @@ Safari may silently block the mixed-content requests to `127.0.0.1` that
 click-to-tune and the live rig card depend on. If either doesn't work on Safari,
 use Chromium/Firefox or terminate TLS in a reverse proxy.
 
+## Releases
+
+Versioning is driven by [`cargo-release`](https://github.com/crate-ci/cargo-release).
+
+```sh
+cargo install cargo-release
+
+cargo release patch              # dry-run, prints what would happen
+cargo release patch --execute    # 0.1.0 -> 0.1.1
+cargo release minor --execute    # 0.1.1 -> 0.2.0
+```
+
+Each `--execute` run bumps the version in `Cargo.toml` / `Cargo.lock`,
+commits it, creates a `vX.Y.Z` tag, and pushes both to `origin`. The
+pushed tag triggers the `release` GitHub Actions workflow, which builds
+binaries for Linux x86_64, Linux aarch64, and macOS aarch64, then
+publishes a GitHub Release with the archives and sha256 sums.
+
+Releases are only permitted from the `main` branch — configured under
+`[package.metadata.release]` in `Cargo.toml`.
+
 ## License
 
 MIT. See [LICENSE](LICENSE).
