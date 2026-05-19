@@ -29,7 +29,7 @@ const DEFAULT_WS_LISTEN_ADDR: &str = "127.0.0.1:54322";
 const DEFAULT_WSJTX_LISTEN_ADDR: &str = "127.0.0.1:2237";
 const DEFAULT_POWER_MAX_WATTS: f32 = 100.0;
 const DEFAULT_POLL_INTERVAL: Duration = Duration::from_secs(1);
-const DEFAULT_RIG_TIMEOUT: Duration = Duration::from_secs(3);
+const DEFAULT_RIG_TIMEOUT: Duration = Duration::from_secs(5);
 const DEFAULT_LOG_LEVEL: &str = "info";
 
 #[derive(Debug, Default, Parser)]
@@ -115,7 +115,7 @@ pub struct Cli {
     /// Per-command read timeout when talking to rigctld. If rigctld
     /// accepts a command but never replies within this window the
     /// connection is dropped and the actor reconnects via the standard
-    /// backoff schedule. Default 3s.
+    /// backoff schedule. Default 5s.
     #[arg(long, env = "WAVELOG_RELAY_RIG_TIMEOUT", value_parser = parse_duration)]
     pub rig_timeout: Option<Duration>,
 
@@ -135,8 +135,8 @@ fn parse_duration(s: &str) -> Result<Duration, humantime::DurationError> {
 /// Subcommands that bypass the daemon and exit after running.
 #[derive(Debug, Subcommand)]
 pub enum Command {
-    /// List Wavelog station profile IDs (one-shot). Useful for
-    /// looking up the `--station-id` value to pass to the daemon.
+    /// List Wavelog station profile IDs. Useful for looking up the
+    /// `--station-id` value to pass to the daemon.
     Stations,
 }
 
@@ -158,8 +158,9 @@ impl StationsConfig {
             .clone()
             .or(toml.wavelog_url)
             .ok_or(ConfigError::MissingWavelogUrl)?;
-        // Validate the URL shape — same gate the daemon applies.
-        let _ = parse_origin(&wavelog_url)?;
+
+        parse_origin(&wavelog_url)?;
+
         Ok(Self {
             wavelog_url: wavelog_url.into(),
             key: key.into(),
@@ -207,7 +208,7 @@ pub struct Config {
     pub no_ws: bool,
     pub wsjtx: bool,
     pub wsjtx_listen_addr: SocketAddr,
-    /// Wavelog station profile ID for QSO submissions. `Some` iff
+    /// Wavelog station profile ID for QSO submissions. `Some` when
     /// [`Self::wsjtx`] is true — [`Config::merge`] enforces this:
     /// enabling WSJT-X without a station_id is a configuration error.
     pub station_id: Option<Box<str>>,

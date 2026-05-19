@@ -63,7 +63,7 @@ Every flag also reads `WAVELOG_RELAY_<UPPERCASE>` from the environment:
 | `--station-id <ID>` | _(required if `--wsjtx`)_ | Wavelog station profile ID for QSO submissions. Run `wavelog-relay stations` to look up IDs |
 | `--qso-queue-path <PATH>` | `$XDG_STATE_HOME/wavelog-relay/qso_queue.jsonl` | On-disk JSONL spool for WSJT-X QSOs awaiting Wavelog. Created if absent |
 | `--interval <DUR>` | `1s` | Humantime: `1s`, `500ms`, etc. |
-| `--rig-timeout <DUR>` | `3s` | Per-command read timeout against rigctld. On expiry the connection is dropped and the actor reconnects via backoff |
+| `--rig-timeout <DUR>` | `5s` | Per-command read timeout against rigctld. On expiry the connection is dropped and the actor reconnects via backoff |
 | `--config <PATH>` | _(auto)_ | Optional TOML; auto-discovered at `$XDG_CONFIG_HOME/wavelog-relay/config.toml` |
 | `--log-level <LEVEL>` | `info` | Tracing filter; `RUST_LOG` env overrides |
 
@@ -96,7 +96,7 @@ wsjtx_listen = "127.0.0.1:2237"
 station_id = "1"
 qso_queue_path = "/var/lib/wavelog-relay/qso_queue.jsonl"
 interval = "1s"
-rig_timeout = "3s"
+rig_timeout = "5s"
 log_level = "info"
 
 # Optional, per-mode hamlib overrides for the ambiguous 
