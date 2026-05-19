@@ -169,7 +169,7 @@ impl StationsConfig {
 }
 
 /// Layered fields that may appear in the optional TOML config file.
-/// Field names mirror the CLI flags (kebab-case → snake_case).
+/// Field names mirror the CLI flags (kebab-case -> snake_case).
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct TomlConfig {
@@ -616,7 +616,7 @@ mod tests {
             cfg.ws_listen_addr,
             "0.0.0.0:54322".parse::<SocketAddr>().unwrap()
         );
-        // TOML asked to disable; CLI didn't pass --no-ws → CLI wins
+        // TOML asked to disable; CLI didn't pass --no-ws -> CLI wins
         // only when it was actually set, so TOML's `true` stands.
         assert!(cfg.no_ws);
         // CLI sets --wsjtx; TOML asks for false but CLI wins.

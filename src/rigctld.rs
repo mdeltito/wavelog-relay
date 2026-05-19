@@ -21,7 +21,7 @@ use serde::Deserialize;
 use thiserror::Error;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufStream};
 use tokio::net::TcpStream;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 
 use crate::modes::HamlibMode;
@@ -36,13 +36,15 @@ use crate::modes::HamlibMode;
 #[must_use]
 pub fn spawn(endpoint: impl Into<Endpoint>, read_timeout: Duration) -> (RigHandle, JoinHandle<()>) {
     let (tx, rx) = mpsc::channel(8);
+    let (health, health_rx) = Health::new();
     let actor = RigActor {
         endpoint: endpoint.into(),
         read_timeout,
         rx,
+        health,
     };
     let join = tokio::spawn(actor.run());
-    (RigHandle { tx }, join)
+    (RigHandle { tx, health_rx }, join)
 }
 
 /// Connection target for rigctld. Accepts both pre-resolved socket
@@ -124,6 +126,7 @@ impl<'de> Deserialize<'de> for Endpoint {
 #[derive(Debug, Clone)]
 pub struct RigHandle {
     tx: mpsc::Sender<RigCommand>,
+    health_rx: watch::Receiver<HealthState>,
 }
 
 /// Snapshot of rig state captured by a single poll cycle.
@@ -191,6 +194,12 @@ impl RigHandle {
         self.request(RigCommand::Poll).await
     }
 
+    /// Current connectivity health, as last published by the actor.
+    /// Used by the poller to slow its cadence during sustained outages.
+    pub(crate) fn health(&self) -> HealthState {
+        *self.health_rx.borrow()
+    }
+
     async fn request<T, F>(&self, make: F) -> Result<T, RigError>
     where
         F: FnOnce(oneshot::Sender<Result<T, RigError>>) -> RigCommand,
@@ -228,6 +237,7 @@ struct RigActor {
     endpoint: Endpoint,
     read_timeout: Duration,
     rx: mpsc::Receiver<RigCommand>,
+    health: Health,
 }
 
 impl RigActor {
@@ -236,19 +246,25 @@ impl RigActor {
         loop {
             match self.connect().await {
                 Ok(stream) => {
-                    tracing::info!(endpoint = %self.endpoint, "rigctld connected");
+                    // INFO only on the first healthy connect of the
+                    // session. Mid-session reconnects (during a degraded
+                    // streak) are silent and recovery is logged when the
+                    // first command succeeds, not when TCP comes up,
+                    // because a fresh socket to rigctld doesn't prove the
+                    // rig itself is responsive again.
+                    if matches!(self.health.state(), HealthState::Healthy) {
+                        tracing::info!(endpoint = %self.endpoint, "rigctld connected");
+                    }
                     backoff_idx = 0;
-                    if let ServeOutcome::ChannelClosed = self.serve(stream).await {
+                    if matches!(self.serve(stream).await, ServeOutcome::ChannelClosed) {
                         return;
                     }
                 },
-                Err(e) => {
-                    tracing::warn!(error = %e, endpoint = %self.endpoint, "rigctld connect failed");
-                },
+                Err(e) => self.record_and_log_failure(&e, DegradedKind::Unreachable),
             }
             let delay = backoff_delay(backoff_idx);
             backoff_idx = backoff_idx.saturating_add(1);
-            tracing::info!(
+            tracing::debug!(
                 endpoint = %self.endpoint,
                 retry_in_ms = delay.as_millis() as u64,
                 "rigctld reconnect scheduled",
@@ -269,12 +285,42 @@ impl RigActor {
     async fn serve(&mut self, stream: TcpStream) -> ServeOutcome {
         let mut conn = Connection::new(stream, self.read_timeout);
         while let Some(cmd) = self.rx.recv().await {
-            if let Err(e) = handle_command(&mut conn, cmd).await {
-                tracing::warn!(error = %e, "rigctld i/o error; reconnecting");
-                return ServeOutcome::Io;
+            match handle_command(&mut conn, cmd).await {
+                Ok(()) => {
+                    if self.health.record_success() {
+                        tracing::info!(endpoint = %self.endpoint, "rigctld recovered");
+                    }
+                },
+                Err(e) => {
+                    self.record_and_log_failure(&e, DegradedKind::Unresponsive);
+                    return ServeOutcome::Io;
+                },
             }
         }
         ServeOutcome::ChannelClosed
+    }
+
+    /// Record a failure on the health state machine and emit the
+    /// appropriate log line. First failure (`1`) from `record_failure` means
+    /// "state transitioned" (Healthy -> Degraded, or a kind change), so
+    /// the operator gets one WARN per streak; continued failures of the
+    /// same kind are DEBUG.
+    fn record_and_log_failure(&mut self, err: &io::Error, kind: DegradedKind) {
+        match self.health.record_failure(kind) {
+            1 => tracing::warn!(
+                error = %err,
+                endpoint = %self.endpoint,
+                kind = kind.as_str(),
+                "rigctld degraded",
+            ),
+            failures => tracing::debug!(
+                error = %err,
+                endpoint = %self.endpoint,
+                kind = kind.as_str(),
+                failures,
+                "rigctld still degraded",
+            ),
+        }
     }
 
     /// Sleep for `delay`, replying `Disconnected` to any commands that
@@ -298,6 +344,89 @@ impl RigActor {
 enum ServeOutcome {
     ChannelClosed,
     Io,
+}
+
+/// Connectivity health for the rigctld socket and the rig behind it.
+///
+/// `Unreachable` = TCP `connect()` is failing (rigctld itself is down).
+/// `Unresponsive` = TCP works but commands fail (rig off, stuck CAT).
+/// The distinction is preserved in the kind tag so the operator can tell
+/// from one log line whether to check rigctld or the rig.
+///
+/// The state is published on a `watch` channel so [`crate::poller`] can
+/// slow its cadence once `failures` crosses its own threshold — the
+/// actor doesn't know or care about the poller's threshold; it just
+/// reports raw counts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HealthState {
+    Healthy,
+    Degraded { kind: DegradedKind, failures: u32 },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DegradedKind {
+    Unreachable,
+    Unresponsive,
+}
+
+impl DegradedKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Unreachable => "unreachable",
+            Self::Unresponsive => "unresponsive",
+        }
+    }
+}
+
+struct Health {
+    state: HealthState,
+    tx: watch::Sender<HealthState>,
+}
+
+impl Health {
+    fn new() -> (Self, watch::Receiver<HealthState>) {
+        let (tx, rx) = watch::channel(HealthState::Healthy);
+        (
+            Self {
+                state: HealthState::Healthy,
+                tx,
+            },
+            rx,
+        )
+    }
+
+    fn state(&self) -> &HealthState {
+        &self.state
+    }
+
+    /// Record a failure and publish. Returns the post-increment failure
+    /// count for this kind — `1` means the failure transitioned the
+    /// state (Healthy -> Degraded, or a kind change), so the caller logs
+    /// at WARN. Any other value is a continued streak — DEBUG.
+    fn record_failure(&mut self, kind: DegradedKind) -> u32 {
+        let failures = match self.state {
+            HealthState::Degraded {
+                kind: prior,
+                failures,
+            } if prior == kind => failures.saturating_add(1),
+            _ => 1,
+        };
+        self.state = HealthState::Degraded { kind, failures };
+        let _ = self.tx.send(self.state);
+        failures
+    }
+
+    /// Record a successful command and publish. Returns `true` when this
+    /// resolved a Degraded streak (the caller logs the recovery once).
+    fn record_success(&mut self) -> bool {
+        if matches!(self.state, HealthState::Degraded { .. }) {
+            self.state = HealthState::Healthy;
+            let _ = self.tx.send(HealthState::Healthy);
+            true
+        } else {
+            false
+        }
+    }
 }
 
 const BACKOFF: [Duration; 5] = [
@@ -734,7 +863,7 @@ mod tests {
     #[tokio::test]
     async fn set_freq_mode_is_atomic_against_concurrent_get_freq() {
         // While set_freq_mode is in flight, another caller queues a
-        // get_freq. The mock asserts F → M → f at the wire; if the
+        // get_freq. The mock asserts F -> M -> f at the wire; if the
         // actor yielded between F and M the `f` would land in between
         // and the mock's `expect("M ...")` would fail.
         let addr = spawn_mock(|mut conn| async move {
@@ -911,7 +1040,7 @@ mod tests {
     #[tokio::test]
     async fn poll_is_atomic_against_concurrent_get_freq() {
         // While poll() is in flight, a racing get_freq queues. The
-        // mock asserts f → m → \get_level RFPOWER → f at the wire;
+        // mock asserts f -> m -> \get_level RFPOWER -> f at the wire;
         // if poll yielded back to the actor's recv loop between any
         // two reads, the racing `f` would land in between and the
         // mock would observe the wrong sequence.
@@ -1097,5 +1226,90 @@ mod tests {
         assert!(matches!(resolved.rigctld, Endpoint::Resolved(_)));
         let host: Wrap = toml::from_str(r#"rigctld = "rig.local:4532""#).unwrap();
         assert!(matches!(host.rigctld, Endpoint::Host { .. }));
+    }
+
+    #[test]
+    fn health_first_failure_returns_one_and_publishes() {
+        let (mut h, rx) = Health::new();
+        assert_eq!(h.record_failure(DegradedKind::Unreachable), 1);
+        assert_eq!(
+            *rx.borrow(),
+            HealthState::Degraded {
+                kind: DegradedKind::Unreachable,
+                failures: 1,
+            }
+        );
+    }
+
+    #[test]
+    fn health_same_kind_repeats_increment_counter() {
+        let (mut h, rx) = Health::new();
+        let _ = h.record_failure(DegradedKind::Unresponsive);
+        assert_eq!(h.record_failure(DegradedKind::Unresponsive), 2);
+        assert_eq!(h.record_failure(DegradedKind::Unresponsive), 3);
+        assert_eq!(
+            *rx.borrow(),
+            HealthState::Degraded {
+                kind: DegradedKind::Unresponsive,
+                failures: 3,
+            }
+        );
+    }
+
+    #[test]
+    fn health_kind_change_resets_counter_to_one() {
+        let (mut h, rx) = Health::new();
+        let _ = h.record_failure(DegradedKind::Unresponsive);
+        let _ = h.record_failure(DegradedKind::Unresponsive);
+        assert_eq!(h.record_failure(DegradedKind::Unreachable), 1);
+        assert_eq!(
+            *rx.borrow(),
+            HealthState::Degraded {
+                kind: DegradedKind::Unreachable,
+                failures: 1,
+            }
+        );
+    }
+
+    #[test]
+    fn health_success_from_healthy_is_noop() {
+        let (mut h, _rx) = Health::new();
+        assert!(!h.record_success());
+        assert!(matches!(h.state, HealthState::Healthy));
+    }
+
+    #[test]
+    fn health_success_recovers_from_degraded_and_publishes() {
+        let (mut h, rx) = Health::new();
+        let _ = h.record_failure(DegradedKind::Unresponsive);
+        let _ = h.record_failure(DegradedKind::Unresponsive);
+        assert!(h.record_success());
+        assert_eq!(*rx.borrow(), HealthState::Healthy);
+    }
+
+    #[tokio::test]
+    async fn rig_handle_exposes_published_health() {
+        // End-to-end: with no rigctld listening, the actor's first
+        // connect attempt fails and publishes Degraded. The handle
+        // surfaces it.
+        let addr: SocketAddr = "127.0.0.1:1".parse().unwrap();
+        let (handle, _join) = spawn(addr, Duration::from_millis(100));
+        // Give the actor a moment to attempt the connect and publish.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            if let HealthState::Degraded {
+                kind: DegradedKind::Unreachable,
+                failures,
+            } = handle.health()
+            {
+                assert!(failures >= 1);
+                return;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "actor never published Degraded",
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
     }
 }

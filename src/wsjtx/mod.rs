@@ -495,7 +495,7 @@ mod tests {
             .await
             .unwrap();
 
-        // Spin until the queue drains (POST landed → remove called).
+        // Spin until the queue drains (POST landed -> remove called).
         let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
         loop {
             if queue.len().await == 0 {

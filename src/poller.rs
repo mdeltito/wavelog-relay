@@ -1,4 +1,4 @@
-//! Periodic poll → push loop.
+//! Periodic poll -> push loop.
 //!
 //! Two tasks share a `watch::channel`:
 //!
@@ -21,14 +21,36 @@
 use std::time::Duration;
 
 use tokio::sync::watch;
-use tokio::time::{Instant, MissedTickBehavior, interval};
+use tokio::time::Instant;
 
-use crate::rigctld::{RigHandle, RigState};
+use crate::rigctld::{HealthState, RigHandle, RigState};
 use crate::util::shutdown_observed;
 use crate::wavelog::WavelogClient;
 use crate::ws::WsHandle;
 
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
+
+/// Failure count (read from the actor's published `HealthState`) at which
+/// the tick loop slows to `DEGRADED_INTERVAL`. Picked low enough to react
+/// quickly to a rig power-off, high enough to ride out single transient
+/// blips at the configured tick.
+const SLOW_AFTER_FAILURES: u32 = 3;
+
+/// Cadence used while the actor reports `failures >= SLOW_AFTER_FAILURES`.
+/// Cuts wakeups by ~15x at the default 1 s interval. Recovery latency is
+/// up to one `DEGRADED_INTERVAL`: we sample health at the start of each
+/// sleep, so a recovery published mid-sleep is observed on the next
+/// iteration, not eagerly.
+const DEGRADED_INTERVAL: Duration = Duration::from_secs(15);
+
+fn cadence_for(state: HealthState, base: Duration) -> Duration {
+    match state {
+        HealthState::Degraded { failures, .. } if failures >= SLOW_AFTER_FAILURES => {
+            DEGRADED_INTERVAL
+        },
+        _ => base,
+    }
+}
 
 /// Run the tick loop and spawn the POST worker. Returns once shutdown
 /// is observed and the worker has joined. Per-tick errors are logged.
@@ -54,18 +76,14 @@ pub async fn run(
         shutdown.clone(),
     ));
 
-    let mut ticker = interval(tick_interval);
-    ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
     tracing::info!(?tick_interval, "poller started");
     loop {
+        let interval = cadence_for(rig.health(), tick_interval);
         tokio::select! {
-            _ = ticker.tick() => {
-                match rig.poll().await {
-                    Ok(state) => {
-                        ws.broadcast(&state);
-                        let _ = state_tx.send(Some(state));
-                    }
-                    Err(e) => tracing::warn!(error = %e, "rig poll failed"),
+            () = tokio::time::sleep(interval) => {
+                if let Ok(state) = rig.poll().await {
+                    ws.broadcast(&state);
+                    let _ = state_tx.send(Some(state));
                 }
             }
             result = shutdown.changed() => {
@@ -97,6 +115,7 @@ async fn radio_worker(
     if *shutdown.borrow_and_update() {
         return;
     }
+
     let mut deduper = Deduper::default();
     loop {
         tokio::select! {
@@ -121,7 +140,13 @@ async fn radio_worker(
                     push_res = client.push_radio(&radio, &state, power_max_watts) => {
                         match push_res {
                             Ok(()) => {
-                                log_radio_push(kind, &radio, &state, power_max_watts);
+                                tracing::info!(
+                                    radio,
+                                    freq = state.freq,
+                                    mode = %state.mode,
+                                    kind = kind.as_str(),
+                                    "wavelog radio state pushed",
+                                );
                                 deduper.record(&state, now);
                             }
                             Err(e) => tracing::warn!(
@@ -194,26 +219,6 @@ impl PushKind {
     }
 }
 
-fn log_radio_push(kind: PushKind, radio: &str, state: &RigState, power_max_watts: f32) {
-    match state.power {
-        Some(p) => tracing::info!(
-            radio,
-            freq = state.freq,
-            mode = %state.mode,
-            power_watts = p * power_max_watts,
-            kind = kind.as_str(),
-            "wavelog radio state pushed",
-        ),
-        None => tracing::info!(
-            radio,
-            freq = state.freq,
-            mode = %state.mode,
-            kind = kind.as_str(),
-            "wavelog radio state pushed",
-        ),
-    }
-}
-
 impl Deduper {
     fn should_skip(&self, state: &RigState, now: Instant) -> bool {
         let (Some(last), Some(last_at)) = (&self.last, self.last_at) else {
@@ -267,7 +272,7 @@ mod tests {
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     use super::*;
-    use crate::rigctld;
+    use crate::rigctld::{self, DegradedKind};
 
     /// Spin up a long-lived TCP server that mimics rigctld's reply
     /// shape for any number of connections and commands. Used as a
@@ -343,8 +348,6 @@ mod tests {
             power: None,
         }
     }
-
-    // -- Deduper unit tests --
 
     #[test]
     fn quantize_rfpower_rounds_to_half_percent_bins() {
@@ -448,8 +451,6 @@ mod tests {
         deduper.record(&state, now);
         assert!(deduper.should_skip(&state, now));
     }
-
-    // -- Poller loop tests --
 
     #[tokio::test]
     async fn shutdown_signal_set_to_true_stops_loop_promptly() {
@@ -757,5 +758,38 @@ mod tests {
         fn count(&self) -> usize {
             self.count.load(std::sync::atomic::Ordering::SeqCst)
         }
+    }
+
+    fn degraded(failures: u32) -> HealthState {
+        HealthState::Degraded {
+            kind: DegradedKind::Unresponsive,
+            failures,
+        }
+    }
+
+    #[test]
+    fn cadence_uses_base_interval_when_healthy() {
+        let base = Duration::from_secs(1);
+        assert_eq!(cadence_for(HealthState::Healthy, base), base);
+    }
+
+    #[test]
+    fn cadence_stays_fast_below_threshold() {
+        let base = Duration::from_secs(1);
+        assert_eq!(cadence_for(degraded(1), base), base);
+        assert_eq!(cadence_for(degraded(SLOW_AFTER_FAILURES - 1), base), base);
+    }
+
+    #[test]
+    fn cadence_slows_at_and_above_threshold() {
+        let base = Duration::from_secs(1);
+        assert_eq!(
+            cadence_for(degraded(SLOW_AFTER_FAILURES), base),
+            DEGRADED_INTERVAL
+        );
+        assert_eq!(
+            cadence_for(degraded(SLOW_AFTER_FAILURES + 100), base),
+            DEGRADED_INTERVAL
+        );
     }
 }

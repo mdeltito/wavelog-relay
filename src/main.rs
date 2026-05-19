@@ -32,7 +32,7 @@ async fn run_stations(cli: Cli) -> anyhow::Result<()> {
     if stations.is_empty() {
         return Err(anyhow!(
             "no stations are configured in Wavelog for this API key — \
-             create one under Account → Station Locations"
+             create one under Account -> Station Locations"
         ));
     }
     print_station_table(&stations);

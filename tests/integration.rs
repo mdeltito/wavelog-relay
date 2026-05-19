@@ -293,7 +293,6 @@ async fn wsjtx_udp_message_forwards_to_wavelog_qso_endpoint() {
     assert_eq!(body["type"], "adif");
     assert_eq!(body["string"], adif);
 
-    // --- shutdown ---
     let _ = shutdown_tx.send(true);
     let _ = tokio::time::timeout(Duration::from_secs(2), listener_task).await;
     let _ = tokio::time::timeout(Duration::from_secs(2), worker_task).await;

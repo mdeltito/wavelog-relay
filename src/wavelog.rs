@@ -432,8 +432,6 @@ mod tests {
         );
     }
 
-    // -- push_radio --
-
     #[tokio::test]
     async fn push_radio_posts_expected_json_body() {
         let server = radio_server_with_response(ResponseTemplate::new(200)).await;
@@ -543,8 +541,6 @@ mod tests {
         assert_eq!(server.received_requests().await.unwrap().len(), 1);
     }
 
-    // -- push_qso --
-
     #[tokio::test]
     async fn push_qso_posts_adif_payload() {
         let server = MockServer::start().await;
@@ -638,8 +634,6 @@ mod tests {
         let err = client.push_qso("3", "<EOR>").await.unwrap_err();
         assert!(matches!(err, WavelogError::BadResponse(_)), "got {err:?}");
     }
-
-    // -- list_stations --
 
     #[tokio::test]
     async fn list_stations_parses_station_info_rows() {
