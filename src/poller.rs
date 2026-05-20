@@ -53,7 +53,7 @@ fn cadence_for(state: HealthState, base: Duration) -> Duration {
 }
 
 /// Run the tick loop and spawn the POST worker. Returns once shutdown
-/// is observed and the worker has joined. Per-tick errors are logged.
+/// is observed and the worker has joined.
 pub async fn run(
     rig: RigHandle,
     client: WavelogClient,
@@ -81,9 +81,12 @@ pub async fn run(
         let interval = cadence_for(rig.health(), tick_interval);
         tokio::select! {
             () = tokio::time::sleep(interval) => {
-                if let Ok(state) = rig.poll().await {
-                    ws.broadcast(&state);
-                    let _ = state_tx.send(Some(state));
+                match rig.poll().await {
+                    Ok(state) => {
+                        ws.broadcast(&state);
+                        let _ = state_tx.send(Some(state));
+                    }
+                    Err(e) => tracing::trace!(error = %e, "rig poll failed"),
                 }
             }
             result = shutdown.changed() => {
@@ -200,7 +203,7 @@ struct DedupeKey {
 enum PushKind {
     /// First push of the session.
     Initial,
-    /// Frequency or mode differs from the last pushed key — a real QSY.
+    /// Frequency or mode differs from the last pushed key.
     Change,
     /// Same freq+mode, different quantized RFPOWER bin.
     Power,
@@ -318,7 +321,7 @@ mod tests {
 
     fn dummy_rig_handle() -> RigHandle {
         // Port 1 is reserved (RFC 1700 "tcpmux") and won't have a real
-        // listener locally — the actor enters backoff but the handle
+        // listener locally. The actor enters backoff but the handle
         // stays valid. Good enough for tests that don't actually tick.
         let addr: SocketAddr = "127.0.0.1:1".parse().unwrap();
         let (handle, _join) = rigctld::spawn(addr, Duration::from_secs(3));
@@ -443,7 +446,7 @@ mod tests {
     fn deduper_quantum_independent_of_power_max() {
         // The bin width is in *fraction-of-full-scale* terms, so a
         // QRP rig with `--power-max 5` gets the same dedupe behaviour
-        // as a 100 W rig — the deduper doesn't even see power_max.
+        // as a 100 W rig and the deduper doesn't even see power_max.
         // 0.5 -> bin 100 regardless of rig.
         let now = Instant::now();
         let state = rig_state(14_074_000, "USB", 0.5);
@@ -538,8 +541,7 @@ mod tests {
     async fn poller_dedupes_repeated_state() {
         // Verifies the integration: poller calls Deduper *and*
         // client.push_radio, and repeat states are collapsed to one
-        // POST on the wire — the property that gives the dedupe its
-        // raison d'être.
+        // POST on the wire.
         let rig_addr = spawn_persistent_rigctld().await;
         let (rig, _rig_join) = rigctld::spawn(rig_addr, Duration::from_secs(3));
 
@@ -577,10 +579,6 @@ mod tests {
 
     #[tokio::test]
     async fn poller_re_pushes_after_failed_push() {
-        // Regression: dedupe state must update only on success. With
-        // the first push failing (3 attempts, all 500), the next
-        // identical-state tick must POST again, not be silently
-        // deduped.
         let rig_addr = spawn_persistent_rigctld().await;
         let (rig, _rig_join) = rigctld::spawn(rig_addr, Duration::from_secs(3));
 
@@ -647,9 +645,7 @@ mod tests {
 
     #[tokio::test]
     async fn ws_broadcast_keeps_running_during_slow_wavelog_post() {
-        // The whole point of the off-tick worker: a multi-second
-        // /api/radio stall must not freeze WS broadcasts. We assert
-        // that the rig is polled (and therefore the WS handle's
+        // We assert that the rig is polled (and therefore the WS handle's
         // broadcast is invoked) repeatedly while the wavelog mock
         // holds every POST for several seconds.
         let rig_addr = spawn_persistent_rigctld().await;
@@ -675,10 +671,6 @@ mod tests {
             shutdown_rx,
         ));
 
-        // Run for ~750ms — well under the 3s POST stall but long
-        // enough to expect ~15 ticks. A pre-refactor poller would
-        // have produced exactly one broadcast (then blocked on the
-        // POST); the worker split lets the tick loop keep polling.
         tokio::time::sleep(Duration::from_millis(750)).await;
         let observed = counter_handle.count();
         assert!(
@@ -726,9 +718,9 @@ mod tests {
             .expect("poller task panicked");
     }
 
-    /// WS handle wrapper that counts how many `broadcast` calls land —
-    /// used to assert the tick loop keeps polling while the worker
-    /// holds an in-flight POST.
+    /// WS handle wrapper that counts how many `broadcast` calls land.
+    /// Assert the tick loop keeps polling while the worker holds an
+    /// in-flight POST.
     struct CountingWsHandle {
         count: std::sync::Arc<std::sync::atomic::AtomicUsize>,
         handle: WsHandle,
