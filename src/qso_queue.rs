@@ -225,8 +225,8 @@ impl QsoQueue {
 }
 
 async fn rewrite_to(path: &std::path::Path, entries: &[Entry]) -> Result<(), QsoQueueError> {
-    // Write to a sibling temp file then rename — avoids leaving a
-    // half-written queue file if the process dies mid-write.
+    // Atomic swap to avoid leaving a half-written file on disk in the event
+    // of a crash or power loss mid-write.
     let temp = path.with_extension("tmp");
     let mut buf = String::new();
     for entry in entries {
@@ -234,8 +234,26 @@ async fn rewrite_to(path: &std::path::Path, entries: &[Entry]) -> Result<(), Qso
         buf.push_str(&line);
         buf.push('\n');
     }
-    fs::write(&temp, buf.as_bytes()).await?;
+
+    {
+        let mut f = OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .open(&temp)
+            .await?;
+        f.write_all(buf.as_bytes()).await?;
+        f.sync_data().await?;
+    }
+
     fs::rename(&temp, path).await?;
+
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        let dir = fs::File::open(parent).await?;
+        dir.sync_all().await?;
+    }
     Ok(())
 }
 
