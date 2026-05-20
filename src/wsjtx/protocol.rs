@@ -122,11 +122,17 @@ impl<'a> Cursor<'a> {
         Ok(u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
     }
 
-    /// Qt `QString`: big-endian `qint32` length, then UTF-8. `-1` is null (empty).
+    /// Qt `QString`: big-endian `qint32` length, then UTF-8. `-1` is the
+    /// null sentinel (treated as empty); any other negative is malformed.
     fn read_qstring(&mut self) -> Result<Box<str>, WsjtxError> {
         let len = self.read_u32()? as i32;
-        if len < 0 {
+        if len == -1 {
             return Ok("".into());
+        }
+        if len < 0 {
+            return Err(WsjtxError::Parse(
+                format!("invalid QString length {len}").into(),
+            ));
         }
         let len = len as usize;
         let bytes = self.take(len)?;
@@ -280,6 +286,22 @@ mod tests {
         let adif = "<EOH><CALL:5>VK3AB <EOR>";
         let s = summarize_adif(adif);
         assert_eq!(s.callsign(), "VK3AB");
+    }
+
+    #[test]
+    fn parse_rejects_non_null_negative_qstring_length() {
+        // -1 is null; anything else negative is a malformed packet and
+        // must not silently become an empty string.
+        let mut bad = Vec::new();
+        bad.extend_from_slice(&MAGIC.to_be_bytes());
+        bad.extend_from_slice(&3u32.to_be_bytes());
+        bad.extend_from_slice(&MSG_TYPE_LOGGED_ADIF.to_be_bytes());
+        bad.extend_from_slice(&(-2i32).to_be_bytes()); // bogus id length
+        let err = parse_logged_adif(&bad).unwrap_err();
+        assert!(
+            matches!(err, WsjtxError::Parse(ref msg) if msg.contains("invalid QString length")),
+            "got {err:?}",
+        );
     }
 
     #[test]
