@@ -25,7 +25,7 @@ use tokio_tungstenite::tungstenite::http::HeaderValue as TungHeaderValue;
 use tokio_tungstenite::tungstenite::protocol::Message as TungMessage;
 use wavelog_relay::modes::ModeOverrides;
 use wavelog_relay::qso_queue::QsoQueue;
-use wavelog_relay::wavelog::WavelogClient;
+use wavelog_relay::wavelog::{StationSource, WavelogClient};
 use wavelog_relay::ws::WsHandle;
 use wavelog_relay::{listener, poller, rigctld, ws, wsjtx};
 use wiremock::matchers::{method, path};
@@ -263,7 +263,7 @@ async fn wsjtx_udp_message_forwards_to_wavelog_qso_endpoint() {
     let (listener_task, worker_task) = wsjtx::spawn(
         udp_listener,
         qso_client,
-        "5".into(),
+        StationSource::Fixed("5".into()),
         None,
         Vec::new(),
         shutdown_rx,
@@ -329,7 +329,7 @@ async fn wsjtx_qso_persists_to_disk_then_drains_on_success() {
     let (listener_task, worker_task) = wsjtx::spawn(
         udp_listener,
         qso_client,
-        "5".into(),
+        StationSource::Fixed("5".into()),
         Some(Arc::clone(&queue)),
         replay.into_vec(),
         shutdown_rx,
@@ -426,7 +426,7 @@ async fn wsjtx_queue_replays_pending_entries_on_startup() {
     let (listener_task, worker_task) = wsjtx::spawn(
         udp_listener,
         qso_client,
-        "5".into(),
+        StationSource::Fixed("5".into()),
         Some(Arc::clone(&queue)),
         replay.into_vec(),
         shutdown_rx,

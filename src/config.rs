@@ -82,8 +82,8 @@ pub struct Cli {
 
     /// Enable the WSJT-X UDP listener. Off by default — binds a UDP
     /// socket and forwards each `Logged ADIF` (type 12) datagram to
-    /// Wavelog's `/api/qso`. Requires `--station-id` to be set as well
-    /// (look one up with `wavelog-relay stations`).
+    /// Wavelog's `/api/qso`. Station profile is resolved automatically
+    /// from Wavelog's active station unless `--station-id` is set.
     #[arg(long, env = "WAVELOG_RELAY_WSJTX")]
     pub wsjtx: bool,
 
@@ -94,9 +94,11 @@ pub struct Cli {
     pub wsjtx_listen: Option<SocketAddr>,
 
     /// Wavelog station profile ID for QSO submissions (the numeric
-    /// `station_id` from `/api/station_info`). Required when
-    /// `--wsjtx` is set. Use `wavelog-relay stations` to look up
-    /// the IDs.
+    /// `station_id` from `/api/station_info`). Optional: when unset,
+    /// the daemon resolves the active station from Wavelog
+    /// (`station_active=1`) at first QSO and caches it for 60s.
+    /// Set explicitly to pin a specific profile. Use `wavelog-relay
+    /// stations` to look up the IDs.
     #[arg(long, env = "WAVELOG_RELAY_STATION_ID")]
     pub station_id: Option<String>,
 
@@ -208,9 +210,9 @@ pub struct Config {
     pub no_ws: bool,
     pub wsjtx: bool,
     pub wsjtx_listen_addr: SocketAddr,
-    /// Wavelog station profile ID for QSO submissions. `Some` when
-    /// [`Self::wsjtx`] is true — [`Config::merge`] enforces this:
-    /// enabling WSJT-X without a station_id is a configuration error.
+    /// Wavelog station profile ID for QSO submissions. `Some` means
+    /// the operator explicitly pinned a profile; `None` means the
+    /// WSJT-X path resolves Wavelog's active station at runtime.
     pub station_id: Option<Box<str>>,
     /// Filesystem path for the persistent QSO queue. Always populated
     /// even when [`Self::wsjtx`] is false — the daemon only opens the
@@ -231,12 +233,6 @@ pub enum ConfigError {
 
     #[error("missing API key: set WAVELOG_RELAY_KEY (raw) or WAVELOG_RELAY_KEY_FILE / --key-file")]
     MissingKey,
-
-    #[error(
-        "--wsjtx requires --station-id: run `wavelog-relay stations` to look up your \
-         Wavelog station profile ID, then pass it via --station-id or WAVELOG_RELAY_STATION_ID"
-    )]
-    MissingStationId,
 
     #[error("invalid wavelog URL `{0}`")]
     InvalidWavelogUrl(Box<str>),
@@ -339,10 +335,6 @@ impl Config {
         });
 
         let station_id: Option<Box<str>> = cli.station_id.or(toml.station_id).map(Into::into);
-
-        if wsjtx && station_id.is_none() {
-            return Err(ConfigError::MissingStationId);
-        }
 
         let qso_queue_path = cli
             .qso_queue_path
@@ -748,7 +740,7 @@ mod tests {
     }
 
     #[test]
-    fn merge_rejects_wsjtx_without_station_id() {
+    fn merge_accepts_wsjtx_without_station_id() {
         let cli = Cli {
             wavelog_url: Some("https://wavelog.test/".to_owned()),
             radio: Some("R".to_owned()),
@@ -756,8 +748,9 @@ mod tests {
             // station_id: None
             ..Cli::default()
         };
-        let err = Config::merge(cli, TomlConfig::default(), "k".to_owned()).unwrap_err();
-        assert!(matches!(err, ConfigError::MissingStationId), "got {err:?}");
+        let cfg = Config::merge(cli, TomlConfig::default(), "k".to_owned()).unwrap();
+        assert!(cfg.wsjtx);
+        assert!(cfg.station_id.is_none());
     }
 
     #[test]

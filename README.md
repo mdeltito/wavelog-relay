@@ -58,9 +58,9 @@ Every flag also reads `WAVELOG_RELAY_<UPPERCASE>` from the environment:
 | `--listen <ADDR>` | `127.0.0.1:54321` | Click-to-tune listener bind |
 | `--ws-listen <ADDR>` | `127.0.0.1:54322` | WebSocket bind. Wavelog's frontend hardcodes this port — only change it if you're fronting with a reverse proxy |
 | `--no-ws` | _(off)_ | Disable the WebSocket server. Frontend falls back to its 3 s AJAX poll |
-| `--wsjtx` | _(off)_ | Enable the WSJT-X UDP listener for forwarding logged QSOs to Wavelog. Requires `--station-id` |
+| `--wsjtx` | _(off)_ | Enable the WSJT-X UDP listener for forwarding logged QSOs to Wavelog |
 | `--wsjtx-listen <ADDR>` | `127.0.0.1:2237` | WSJT-X UDP listener bind (honored only with `--wsjtx`). Must match WSJT-X's `Settings -> Reporting -> UDP Server` *and* its delivery model — unicast (`127.0.0.1`) or multicast (`224.0.0.1`). See [WSJT-X QSO forwarding](#wsjt-x-qso-forwarding) |
-| `--station-id <ID>` | _(required if `--wsjtx`)_ | Wavelog station profile ID for QSO submissions. Run `wavelog-relay stations` to look up IDs |
+| `--station-id <ID>` | _(auto-resolved)_ | Pin a specific Wavelog station profile ID for QSO submissions. When unset, the daemon resolves the currently-active station from Wavelog at first QSO (cached 60s). Run `wavelog-relay stations` to look up IDs |
 | `--qso-queue-path <PATH>` | `$XDG_STATE_HOME/wavelog-relay/qso_queue.jsonl` | On-disk JSONL spool for WSJT-X QSOs awaiting Wavelog. Created if absent |
 | `--interval <DUR>` | `1s` | Humantime: `1s`, `500ms`, etc. |
 | `--rig-timeout <DUR>` | `5s` | Per-command read timeout against rigctld. On expiry the connection is dropped and the actor reconnects via backoff |
@@ -167,7 +167,6 @@ ExecStart=/usr/local/bin/wavelog-relay \
   --wavelog-url https://wavelog.example.com/index.php \
   --radio FT-710 \
   --power-max 100 \
-  --station-id 1 \
   --wsjtx \
   --wsjtx-listen 224.0.0.1:2237 \
   --log-level info
@@ -201,20 +200,35 @@ Pass `--wsjtx` (or set `WAVELOG_RELAY_WSJTX=1`, or `wsjtx = true` in TOML) to en
 **NOTE** JTDX and MSHV speak the same protocol; the configuration is identical and
 it should work with either, but it has not yet been tested and your mileage may vary.
 
-Wavelog's `/api/qso` requires a `station_profile_id`, and the daemon refuses to
-start with `--wsjtx` unless `--station-id` is set. Look yours up once:
+### Station profile
+
+Wavelog's `/api/qso` requires a `station_profile_id`. wavelog-relay handles
+this in one of two ways:
+
+- **Auto-resolve (default).** When `--station-id` is unset, the daemon asks
+  Wavelog for the currently-active station (`station_active=1` in
+  `/api/station_info`) the first time a QSO arrives, then caches the result
+  for 60 seconds. Flip the active station in Wavelog's UI and the next QSO
+  routes to the new profile — no daemon restart required. Common case:
+  setting your home station active for SSB rag-chews and flipping to a POTA
+  profile for an activation, with WSJT-X following automatically.
+- **Static override.** Pass `--station-id <ID>` to pin a specific profile.
+  The daemon never calls `/api/station_info` in this mode and the 60s cache
+  is bypassed entirely.
+
+Look up the IDs (and see which one is active) with `wavelog-relay stations`:
 
 ```sh
 wavelog-relay stations
-# ID  NAME      CALLSIGN
-# --  --------  --------
-#  1  Home      N0CALL
-#  2  Portable  N0CALL/P
+#     ID  NAME      CALLSIGN
+#     --  --------  --------
+#     1   Home      N0CALL
+# [*] 2   Portable  N0CALL/P
 ```
 
 `stations` is one-shot — it hits `/api/station_info`, prints the table, and
-exits. Same `--wavelog-url` / `--key-file` / `WAVELOG_RELAY_KEY` resolution as
-the daemon.
+exits. The `[*]` marker flags the active profile. Same `--wavelog-url` /
+`--key-file` / `WAVELOG_RELAY_KEY` resolution as the daemon.
 
 ### Pick a delivery model
 
@@ -232,9 +246,9 @@ In WSJT-X: **Settings -> Reporting -> UDP Server** = `127.0.0.1` (solo) or
 
 ```sh
 # solo
-wavelog-relay ... --wsjtx --station-id 1
+wavelog-relay ... --wsjtx
 # shared
-wavelog-relay ... --wsjtx --wsjtx-listen 224.0.0.1:2237 --station-id 1
+wavelog-relay ... --wsjtx --wsjtx-listen 224.0.0.1:2237
 ```
 
 For multicast, point every other consumer at `224.0.0.1:2237` and enable its
