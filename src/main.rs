@@ -6,7 +6,7 @@ use tokio::sync::watch;
 use tracing_subscriber::EnvFilter;
 use wavelog_relay::config::{Cli, Command, Config, StationsConfig};
 use wavelog_relay::qso_queue::QsoQueue;
-use wavelog_relay::wavelog::{Station, WavelogClient};
+use wavelog_relay::wavelog::{Station, StationSource, WavelogClient};
 use wavelog_relay::ws::WsHandle;
 use wavelog_relay::{listener, poller, rigctld, ws, wsjtx};
 
@@ -58,19 +58,21 @@ fn print_station_table(stations: &[Station]) {
         .max()
         .unwrap_or(8)
         .max(8);
+
     println!(
-        "{:>id_w$}  {:<name_w$}  {:<call_w$}",
+        "    {:>id_w$}  {:<name_w$}  {:<call_w$}",
         "ID", "NAME", "CALLSIGN",
     );
     println!(
-        "{:>id_w$}  {:<name_w$}  {:<call_w$}",
+        "    {:>id_w$}  {:<name_w$}  {:<call_w$}",
         "-".repeat(id_w),
         "-".repeat(name_w),
         "-".repeat(call_w),
     );
     for s in stations {
+        let marker = if s.active { "[*] " } else { "    " };
         println!(
-            "{:>id_w$}  {:<name_w$}  {:<call_w$}",
+            "{marker}{:>id_w$}  {:<name_w$}  {:<call_w$}",
             &*s.id, &*s.name, &*s.callsign,
         );
     }
@@ -161,9 +163,8 @@ async fn run_daemon(cli: Cli) -> anyhow::Result<()> {
         ))
     });
 
-    // station_id is Some iff config.wsjtx (Config::merge enforces it).
-    let wsjtx_tasks = match (wsjtx_socket, config.station_id) {
-        (Some(socket), Some(station_id)) => {
+    let wsjtx_tasks = match wsjtx_socket {
+        Some(socket) => {
             let (queue, replay) = QsoQueue::open(config.qso_queue_path.clone())
                 .await
                 .with_context(|| {
@@ -177,16 +178,20 @@ async fn run_daemon(cli: Cli) -> anyhow::Result<()> {
                 replay_count = replay.len(),
                 "wsjtx persistent queue opened",
             );
+            let station = match config.station_id {
+                Some(id) => StationSource::Fixed(id),
+                None => StationSource::active(client.clone()),
+            };
             Some(wsjtx::spawn(
                 socket,
                 client,
-                station_id,
+                station,
                 Some(Arc::new(queue)),
                 replay.into_vec(),
                 shutdown_rx.clone(),
             ))
         },
-        _ => None,
+        None => None,
     };
 
     // Tasks hold the clones; dropping these here lets the rig actor and

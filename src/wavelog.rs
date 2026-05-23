@@ -15,11 +15,13 @@
 
 use std::fmt;
 use std::future::Future;
-use std::time::Duration;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use reqwest::Url;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+use tokio::sync::Mutex;
 
 use crate::rigctld::RigState;
 
@@ -63,12 +65,15 @@ impl fmt::Debug for Redacted<'_> {
 
 /// A Wavelog station-profile entry as returned by `/api/station_info`.
 /// `id` is the value to pass as `station_profile_id` when submitting
-/// QSOs to `/api/qso`.
+/// QSOs to `/api/qso`. `active` reflects Wavelog's per-user
+/// `station_active` flag — exactly one profile per API-key owner is
+/// active at a time.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Station {
     pub id: Box<str>,
     pub name: Box<str>,
     pub callsign: Box<str>,
+    pub active: bool,
 }
 
 #[derive(Debug, Error)]
@@ -86,6 +91,12 @@ pub enum WavelogError {
     /// transport succeeded; only the logical operation failed.
     #[error("wavelog rejected the submission: {reason}")]
     Rejected { reason: Box<str> },
+
+    /// `/api/station_info` returned no profile with `station_active=1`.
+    /// Not retryable in the transport sense — the operator needs to
+    /// pick an active station in the Wavelog UI first.
+    #[error("wavelog has no active station profile for this API key")]
+    NoActiveStation,
 
     #[error("wavelog response could not be parsed: {0}")]
     BadResponse(Box<str>),
@@ -198,9 +209,8 @@ impl WavelogClient {
         })
     }
 
-    /// Fetch the list of station profiles configured in Wavelog for
-    /// the API key this client was constructed with. One-shot — no
-    /// retries — used by the `stations` subcommand.
+    /// One-shot fetch of station profiles configured in Wavelog for
+    /// the API key this client was constructed with.
     pub async fn list_stations(&self) -> Result<Vec<Station>, WavelogError> {
         let url = build_station_info_url(&self.base_url, &self.key)?;
         let response = self.http.get(url).send().await?;
@@ -215,6 +225,121 @@ impl WavelogClient {
         let raw: Vec<StationInfoRow> = serde_json::from_str(&body)
             .map_err(|e| WavelogError::BadResponse(format!("{e}: {body}").into()))?;
         Ok(raw.into_iter().map(Station::from).collect())
+    }
+
+    /// Return the `id` of the station profile currently flagged active
+    /// in Wavelog (`station_active=1`). Errors with
+    /// [`WavelogError::NoActiveStation`] if no row has the flag set.
+    pub async fn find_active_station(&self) -> Result<Box<str>, WavelogError> {
+        with_retries("find_active_station", || async {
+            let stations = self.list_stations().await?;
+            let active = stations
+                .iter()
+                .find(|s| s.active)
+                .ok_or(WavelogError::NoActiveStation)?;
+
+            Ok(active.id.clone())
+        })
+        .await
+    }
+}
+
+/// Default TTL for [`ActiveStationCache`]. Chosen so that an operator
+/// flipping the active station in the Wavelog UI sees the daemon route
+/// QSOs to the new station within one cache window without a restart;
+/// also small enough that the daemon doesn't pin onto a stale value if
+/// they forget they changed it.
+const DEFAULT_ACTIVE_TTL: Duration = Duration::from_mins(5);
+
+/// Source of the `station_profile_id` for outbound QSO POSTs.
+///
+/// - [`StationSource::Fixed`] returns a pre-configured ID with no
+///   network traffic — used when the operator passed `--station-id`.
+/// - [`StationSource::Active`] looks the active station up via
+///   `/api/station_info` on first use and caches the result for
+///   [`DEFAULT_ACTIVE_TTL`]. Used when `--station-id` is unset.
+///
+/// `Clone` semantics differ by variant: cloning `Active` shares the
+/// underlying cache via `Arc<Mutex>`, cloning `Fixed` allocates a
+/// fresh owned ID.
+#[derive(Clone)]
+pub enum StationSource {
+    Fixed(Box<str>),
+    Active(ActiveStationCache),
+}
+
+impl StationSource {
+    /// Construct an active-lookup source using the standard 60-second
+    /// cache TTL.
+    pub fn active(client: WavelogClient) -> Self {
+        Self::Active(ActiveStationCache::new(client, DEFAULT_ACTIVE_TTL))
+    }
+
+    /// Resolve to a station ID. Returns the configured ID for
+    /// [`StationSource::Fixed`]; for [`StationSource::Active`] consults
+    /// the cache and refreshes via Wavelog on miss.
+    pub async fn resolve(&self) -> Result<Box<str>, WavelogError> {
+        match self {
+            Self::Fixed(id) => Ok(id.clone()),
+            Self::Active(cache) => cache.resolve().await,
+        }
+    }
+}
+
+impl fmt::Debug for StationSource {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Fixed(id) => write!(f, "Fixed({id:?})"),
+            Self::Active(cache) => match cache.state.try_lock() {
+                Ok(guard) => match guard.as_ref() {
+                    Some(cached) => write!(f, "Active(cached={:?})", &*cached.id),
+                    None => f.write_str("Active(unresolved)"),
+                },
+                Err(_) => f.write_str("Active(refreshing)"),
+            },
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct ActiveStationCache {
+    client: WavelogClient,
+    state: Arc<Mutex<Option<CachedActive>>>,
+    ttl: Duration,
+}
+
+#[derive(Clone)]
+struct CachedActive {
+    id: Box<str>,
+    fetched_at: Instant,
+}
+
+impl ActiveStationCache {
+    fn new(client: WavelogClient, ttl: Duration) -> Self {
+        Self {
+            client,
+            state: Arc::new(Mutex::new(None)),
+            ttl,
+        }
+    }
+
+    async fn resolve(&self) -> Result<Box<str>, WavelogError> {
+        // Hold the mutex across the fetch so only one in-flight lookup
+        // runs at a time. WSJT-X QSOs are serial through the worker,
+        // so contention here is a non-issue in practice.
+        let mut state = self.state.lock().await;
+        if let Some(cached) = state.as_ref()
+            && cached.fetched_at.elapsed() < self.ttl
+        {
+            return Ok(cached.id.clone());
+        }
+        let id = self.client.find_active_station().await?;
+        tracing::info!(station_id = %id, "resolved active wavelog station");
+        *state = Some(CachedActive {
+            id: id.clone(),
+            fetched_at: Instant::now(),
+        });
+        Ok(id)
     }
 }
 
@@ -300,6 +425,8 @@ struct StationInfoRow {
     station_id: String,
     station_profile_name: String,
     station_callsign: String,
+    #[serde(default)]
+    station_active: Option<String>,
 }
 
 impl From<StationInfoRow> for Station {
@@ -308,6 +435,7 @@ impl From<StationInfoRow> for Station {
             id: row.station_id.into(),
             name: row.station_profile_name.into(),
             callsign: row.station_callsign.into(),
+            active: row.station_active.as_deref() == Some("1"),
         }
     }
 }
@@ -318,6 +446,7 @@ fn is_retryable(err: &WavelogError) -> bool {
         WavelogError::Status { status, .. } => *status >= 500,
         WavelogError::InvalidUrl(_)
         | WavelogError::Rejected { .. }
+        | WavelogError::NoActiveStation
         | WavelogError::BadResponse(_) => false,
     }
 }
@@ -412,6 +541,7 @@ mod tests {
         assert!(!is_retryable(&WavelogError::Rejected {
             reason: "dup".into()
         }));
+        assert!(!is_retryable(&WavelogError::NoActiveStation));
         assert!(!is_retryable(&WavelogError::BadResponse("garbage".into())));
     }
 
@@ -645,11 +775,13 @@ mod tests {
                     "station_id": "1",
                     "station_profile_name": "Home",
                     "station_callsign": "K1AB",
+                    "station_active": "1",
                 },
                 {
                     "station_id": "2",
                     "station_profile_name": "Portable",
                     "station_callsign": "K1AB/P",
+                    "station_active": null,
                 }
             ])))
             .mount(&server)
@@ -660,7 +792,218 @@ mod tests {
         assert_eq!(&*stations[0].id, "1");
         assert_eq!(&*stations[0].name, "Home");
         assert_eq!(&*stations[0].callsign, "K1AB");
+        assert!(stations[0].active);
         assert_eq!(&*stations[1].id, "2");
+        assert!(!stations[1].active);
+    }
+
+    #[tokio::test]
+    async fn find_active_station_returns_active_id() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/station_info/test-key"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+                { "station_id": "1", "station_profile_name": "Home", "station_callsign": "K1", "station_active": null },
+                { "station_id": "7", "station_profile_name": "Portable", "station_callsign": "K1/P", "station_active": "1" },
+                { "station_id": "9", "station_profile_name": "DX", "station_callsign": "K1/DX", "station_active": null },
+            ])))
+            .mount(&server)
+            .await;
+        let client = client_for(&server);
+        let id = client.find_active_station().await.unwrap();
+        assert_eq!(&*id, "7");
+    }
+
+    #[tokio::test]
+    async fn find_active_station_errors_when_no_row_is_active() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/station_info/test-key"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+                { "station_id": "1", "station_profile_name": "Home", "station_callsign": "K1", "station_active": null },
+            ])))
+            .mount(&server)
+            .await;
+        let client = client_for(&server);
+        let err = client.find_active_station().await.unwrap_err();
+        assert!(matches!(err, WavelogError::NoActiveStation), "got {err:?}");
+    }
+
+    #[tokio::test]
+    async fn find_active_station_picks_first_when_multiple_rows_are_flagged() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/station_info/test-key"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+                { "station_id": "5", "station_profile_name": "a", "station_callsign": "K1", "station_active": "1" },
+                { "station_id": "6", "station_profile_name": "b", "station_callsign": "K2", "station_active": "1" },
+            ])))
+            .mount(&server)
+            .await;
+        let client = client_for(&server);
+        let id = client.find_active_station().await.unwrap();
+        assert_eq!(&*id, "5");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn find_active_station_retries_5xx_then_succeeds() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/station_info/test-key"))
+            .respond_with(ResponseTemplate::new(503))
+            .up_to_n_times(2)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/station_info/test-key"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+                { "station_id": "7", "station_profile_name": "Home", "station_callsign": "K1", "station_active": "1" },
+            ])))
+            .mount(&server)
+            .await;
+        let client = client_for(&server);
+        let id = client.find_active_station().await.unwrap();
+        assert_eq!(&*id, "7");
+        assert_eq!(server.received_requests().await.unwrap().len(), 3);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn find_active_station_does_not_retry_no_active_station() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/station_info/test-key"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+                { "station_id": "1", "station_profile_name": "Home", "station_callsign": "K1", "station_active": null },
+            ])))
+            .mount(&server)
+            .await;
+        let client = client_for(&server);
+        let err = client.find_active_station().await.unwrap_err();
+        assert!(matches!(err, WavelogError::NoActiveStation), "got {err:?}");
+        // NoActiveStation is non-retryable: reflects UI state, not transport.
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn fixed_station_source_returns_configured_id() {
+        let src = StationSource::Fixed("42".into());
+        let resolved = src.resolve().await.unwrap();
+        assert_eq!(&*resolved, "42");
+    }
+
+    fn station_info_mock_response(active_id: &str) -> ResponseTemplate {
+        ResponseTemplate::new(200).set_body_json(serde_json::json!([
+            {
+                "station_id": "1",
+                "station_profile_name": "Home",
+                "station_callsign": "K1",
+                "station_active": null,
+            },
+            {
+                "station_id": active_id,
+                "station_profile_name": "Portable",
+                "station_callsign": "K1/P",
+                "station_active": "1",
+            }
+        ]))
+    }
+
+    #[tokio::test]
+    async fn active_station_cache_serves_cached_value_within_ttl() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/station_info/test-key"))
+            .respond_with(station_info_mock_response("7"))
+            .mount(&server)
+            .await;
+        let client = client_for(&server);
+        let cache = ActiveStationCache::new(client, Duration::from_secs(300));
+
+        let a = cache.resolve().await.unwrap();
+        let b = cache.resolve().await.unwrap();
+        assert_eq!(&*a, "7");
+        assert_eq!(&*b, "7");
+        assert_eq!(
+            server.received_requests().await.unwrap().len(),
+            1,
+            "second resolve within TTL must hit the cache, not the network",
+        );
+    }
+
+    #[tokio::test]
+    async fn active_station_cache_refreshes_after_ttl() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/station_info/test-key"))
+            .respond_with(station_info_mock_response("7"))
+            .mount(&server)
+            .await;
+        let client = client_for(&server);
+        // Very short TTL — real time, so the second resolve falls outside the window.
+        let cache = ActiveStationCache::new(client, Duration::from_millis(10));
+
+        cache.resolve().await.unwrap();
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        cache.resolve().await.unwrap();
+        assert_eq!(
+            server.received_requests().await.unwrap().len(),
+            2,
+            "resolve after TTL expiry must re-fetch",
+        );
+    }
+
+    #[tokio::test]
+    async fn active_station_cache_does_not_poison_on_error() {
+        let server = MockServer::start().await;
+        // First call fails with NoActiveStation (no row is active),
+        // second call returns a populated active row.
+        Mock::given(method("GET"))
+            .and(path("/api/station_info/test-key"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+                { "station_id": "1", "station_profile_name": "Home", "station_callsign": "K1", "station_active": null },
+            ])))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/station_info/test-key"))
+            .respond_with(station_info_mock_response("7"))
+            .mount(&server)
+            .await;
+        let client = client_for(&server);
+        let cache = ActiveStationCache::new(client, Duration::from_secs(300));
+
+        let first = cache.resolve().await;
+        assert!(
+            matches!(first, Err(WavelogError::NoActiveStation)),
+            "expected NoActiveStation, got {first:?}",
+        );
+        let second = cache.resolve().await.unwrap();
+        assert_eq!(
+            &*second, "7",
+            "second resolve must re-fetch (error did not poison cache)",
+        );
+    }
+
+    #[tokio::test]
+    async fn active_station_cache_is_shared_across_clones() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/station_info/test-key"))
+            .respond_with(station_info_mock_response("7"))
+            .mount(&server)
+            .await;
+        let client = client_for(&server);
+        let cache = ActiveStationCache::new(client, Duration::from_secs(300));
+        let clone = cache.clone();
+
+        cache.resolve().await.unwrap();
+        clone.resolve().await.unwrap();
+        assert_eq!(
+            server.received_requests().await.unwrap().len(),
+            1,
+            "cloned cache must share state with the original",
+        );
     }
 
     #[tokio::test]

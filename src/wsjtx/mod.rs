@@ -33,7 +33,7 @@ use tokio::task::JoinHandle;
 
 use crate::qso_queue::QsoQueue;
 use crate::util::shutdown_observed;
-use crate::wavelog::{WavelogClient, WavelogError};
+use crate::wavelog::{StationSource, WavelogClient, WavelogError};
 
 const QUEUE_CAPACITY: usize = 32;
 const RECV_BUF_SIZE: usize = 65_535;
@@ -43,7 +43,8 @@ const RECV_BUF_SIZE: usize = 65_535;
 /// The listener reads from the pre-bound `socket`, parses
 /// Logged-ADIF messages, and pipes them through a bounded queue to
 /// the worker, which submits each QSO via
-/// [`WavelogClient::push_qso`] with the given `station_id`.
+/// [`WavelogClient::push_qso`] using the station ID returned by
+/// [`StationSource::resolve`] at POST time.
 ///
 /// `queue` enables on-disk persistence: the listener appends every
 /// accepted ADIF to disk before queueing, and the worker removes the
@@ -63,7 +64,7 @@ const RECV_BUF_SIZE: usize = 65_535;
 pub fn spawn(
     socket: UdpSocket,
     client: WavelogClient,
-    station_id: Box<str>,
+    station: StationSource,
     queue: Option<Arc<QsoQueue>>,
     replay: Vec<(u64, Box<str>)>,
     shutdown: watch::Receiver<bool>,
@@ -74,10 +75,10 @@ pub fn spawn(
         tx,
         queue.clone(),
         replay,
-        station_id.clone(),
+        station.clone(),
         shutdown.clone(),
     ));
-    let worker = tokio::spawn(post_loop(rx, client, station_id, queue, shutdown));
+    let worker = tokio::spawn(post_loop(rx, client, station, queue, shutdown));
     (listener, worker)
 }
 
@@ -96,13 +97,13 @@ async fn listen(
     tx: mpsc::Sender<QueueItem>,
     queue: Option<Arc<QsoQueue>>,
     replay: Vec<(u64, Box<str>)>,
-    station_id: Box<str>,
+    station: StationSource,
     mut shutdown: watch::Receiver<bool>,
 ) {
     if let Ok(addr) = socket.local_addr() {
         tracing::info!(
             addr = %addr,
-            station_id = %station_id,
+            station = ?station,
             replay_count = replay.len(),
             "wsjtx listener serving",
         );
@@ -204,7 +205,7 @@ async fn listen(
 async fn post_loop(
     mut rx: mpsc::Receiver<QueueItem>,
     client: WavelogClient,
-    station_id: Box<str>,
+    station: StationSource,
     queue: Option<Arc<QsoQueue>>,
     mut shutdown: watch::Receiver<bool>,
 ) {
@@ -215,9 +216,10 @@ async fn post_loop(
         tokio::select! {
             item = rx.recv() => match item {
                 Some(item) => {
-                    // Inner select cancels the in-flight POST on shutdown.
+                    // Inner select cancels the in-flight POST (and the
+                    // preceding active-station lookup, if any) on shutdown.
                     tokio::select! {
-                        push_res = client.push_qso(&station_id, &item.adif) => {
+                        push_res = push_one(&client, &station, &item.adif) => {
                             handle_post_outcome(push_res, &item, queue.as_deref()).await;
                         },
                         result = shutdown.changed() => {
@@ -238,6 +240,18 @@ async fn post_loop(
             }
         }
     }
+}
+
+/// Resolve the station ID and submit the ADIF. Pulled out so the
+/// resolve + POST sequence shares a single cancellation boundary in
+/// [`post_loop`].
+async fn push_one(
+    client: &WavelogClient,
+    station: &StationSource,
+    adif: &str,
+) -> Result<(), WavelogError> {
+    let station_id = station.resolve().await?;
+    client.push_qso(&station_id, adif).await
 }
 
 async fn handle_post_outcome(
@@ -326,8 +340,14 @@ mod tests {
         let listen_addr = socket.local_addr().unwrap();
         let client = WavelogClient::new(&server.uri(), "test-key").unwrap();
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
-        let (listener_task, worker_task) =
-            spawn(socket, client, "7".into(), None, Vec::new(), shutdown_rx);
+        let (listener_task, worker_task) = spawn(
+            socket,
+            client,
+            StationSource::Fixed("7".into()),
+            None,
+            Vec::new(),
+            shutdown_rx,
+        );
 
         // Send the WSJT-X packet from a separate socket.
         let sender = UdpSocket::bind("127.0.0.1:0").await.unwrap();
@@ -372,8 +392,14 @@ mod tests {
         let listen_addr = socket.local_addr().unwrap();
         let client = WavelogClient::new(&server.uri(), "test-key").unwrap();
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
-        let (listener_task, worker_task) =
-            spawn(socket, client, "1".into(), None, Vec::new(), shutdown_rx);
+        let (listener_task, worker_task) = spawn(
+            socket,
+            client,
+            StationSource::Fixed("1".into()),
+            None,
+            Vec::new(),
+            shutdown_rx,
+        );
 
         let sender = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         sender
@@ -400,8 +426,14 @@ mod tests {
         let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let client = WavelogClient::new(&server.uri(), "k").unwrap();
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
-        let (listener_task, worker_task) =
-            spawn(socket, client, "1".into(), None, Vec::new(), shutdown_rx);
+        let (listener_task, worker_task) = spawn(
+            socket,
+            client,
+            StationSource::Fixed("1".into()),
+            None,
+            Vec::new(),
+            shutdown_rx,
+        );
 
         shutdown_tx.send(true).unwrap();
         tokio::time::timeout(Duration::from_millis(500), listener_task)
@@ -430,8 +462,14 @@ mod tests {
         let listen_addr = socket.local_addr().unwrap();
         let client = WavelogClient::new(&server.uri(), "test-key").unwrap();
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
-        let (listener_task, worker_task) =
-            spawn(socket, client, "1".into(), None, Vec::new(), shutdown_rx);
+        let (listener_task, worker_task) = spawn(
+            socket,
+            client,
+            StationSource::Fixed("1".into()),
+            None,
+            Vec::new(),
+            shutdown_rx,
+        );
 
         // Push one ADIF in to start a POST.
         let sender = UdpSocket::bind("127.0.0.1:0").await.unwrap();
@@ -480,7 +518,7 @@ mod tests {
         let (listener_task, worker_task) = spawn(
             socket,
             client,
-            "7".into(),
+            StationSource::Fixed("7".into()),
             Some(queue.clone()),
             Vec::new(),
             shutdown_rx,
@@ -547,7 +585,7 @@ mod tests {
         let (listener_task, worker_task) = spawn(
             socket,
             client,
-            "7".into(),
+            StationSource::Fixed("7".into()),
             Some(queue.clone()),
             Vec::new(),
             shutdown_rx,
@@ -607,7 +645,7 @@ mod tests {
         let (listener_task, worker_task) = spawn(
             socket,
             client,
-            "7".into(),
+            StationSource::Fixed("7".into()),
             Some(queue.clone()),
             replay.into_vec(),
             shutdown_rx,
@@ -636,6 +674,153 @@ mod tests {
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
+
+        let _ = shutdown_tx.send(true);
+        let _ = tokio::time::timeout(Duration::from_secs(2), listener_task).await;
+        let _ = tokio::time::timeout(Duration::from_secs(2), worker_task).await;
+    }
+
+    #[tokio::test]
+    async fn active_station_source_routes_qso_to_active_profile() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/station_info/test-key"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+                { "station_id": "3", "station_profile_name": "Home", "station_callsign": "K1", "station_active": null },
+                { "station_id": "11", "station_profile_name": "Portable", "station_callsign": "K1/P", "station_active": "1" },
+            ])))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/qso"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "status": "created",
+            })))
+            .mount(&server)
+            .await;
+
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let listen_addr = socket.local_addr().unwrap();
+        let client = WavelogClient::new(&server.uri(), "test-key").unwrap();
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let (listener_task, worker_task) = spawn(
+            socket,
+            client.clone(),
+            StationSource::active(client),
+            None,
+            Vec::new(),
+            shutdown_rx,
+        );
+
+        let sender = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        sender
+            .send_to(
+                &encode_logged_adif("WSJT-X", "<CALL:5>VK3AB <MODE:3>FT8 <EOR>"),
+                listen_addr,
+            )
+            .await
+            .unwrap();
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        loop {
+            let qso_requests: Vec<_> = server
+                .received_requests()
+                .await
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|r| r.url.path() == "/api/qso")
+                .collect();
+            if let Some(req) = qso_requests.first() {
+                let body: serde_json::Value = serde_json::from_slice(&req.body).unwrap();
+                assert_eq!(
+                    body["station_profile_id"], "11",
+                    "QSO must have been routed to the active station",
+                );
+                break;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                panic!("wavelog never received the QSO POST");
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
+        let _ = shutdown_tx.send(true);
+        let _ = tokio::time::timeout(Duration::from_secs(2), listener_task).await;
+        let _ = tokio::time::timeout(Duration::from_secs(2), worker_task).await;
+    }
+
+    #[tokio::test]
+    async fn no_active_station_keeps_qso_on_spool_and_skips_post() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/station_info/test-key"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+                { "station_id": "3", "station_profile_name": "Home", "station_callsign": "K1", "station_active": null },
+            ])))
+            .mount(&server)
+            .await;
+        // No mock for /api/qso — assertion is that it's never hit.
+
+        let dir = tempfile::tempdir().unwrap();
+        let queue_path = dir.path().join("queue.jsonl");
+        let (queue, _replay) = QsoQueue::open(queue_path.clone()).await.unwrap();
+        let queue = Arc::new(queue);
+
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let listen_addr = socket.local_addr().unwrap();
+        let client = WavelogClient::new(&server.uri(), "test-key").unwrap();
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let (listener_task, worker_task) = spawn(
+            socket,
+            client.clone(),
+            StationSource::active(client),
+            Some(queue.clone()),
+            Vec::new(),
+            shutdown_rx,
+        );
+
+        let sender = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        sender
+            .send_to(
+                &encode_logged_adif("WSJT-X", "<CALL:5>VK3AB <EOR>"),
+                listen_addr,
+            )
+            .await
+            .unwrap();
+
+        // Give the worker time to consume + fail + retry cycle.
+        // Resolver returns NoActiveStation (non-retryable) so the
+        // retry chain collapses immediately; the entry stays on disk.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            // Wait until the queue at least observed the QSO arrive on disk.
+            if queue.len().await >= 1 {
+                break;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                panic!("ADIF never landed on disk");
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        // Give the worker a moment to complete (or skip) the POST.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        let qso_posts = server
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|r| r.url.path() == "/api/qso")
+            .count();
+        assert_eq!(
+            qso_posts, 0,
+            "no /api/qso POST should fire when no active station is configured",
+        );
+        assert_eq!(
+            queue.len().await,
+            1,
+            "QSO must stay on spool when station resolution fails",
+        );
 
         let _ = shutdown_tx.send(true);
         let _ = tokio::time::timeout(Duration::from_secs(2), listener_task).await;
