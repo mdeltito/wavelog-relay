@@ -1,28 +1,19 @@
-//! Wavelog HTTP client.
+//! Stateless HTTP client for Wavelog's REST API.
 //!
-//! [`WavelogClient`] is stateless and [`Clone`] — safe to share
-//! between the poller, the WSJT-X worker, and the one-shot subcommand.
-//! Three endpoints:
-//!
-//! - [`push_radio`](WavelogClient::push_radio) — `POST /api/radio`,
-//!   used by the poller for live rig-state updates. Caller owns any
-//!   dedupe / heartbeat policy.
-//! - [`push_qso`](WavelogClient::push_qso) — `POST /api/qso`. Wavelog
-//!   signals success via JSON `status: "created"`; 2xx alone is not
-//!   enough (duplicates and validation errors return 200 too).
-//! - [`list_stations`](WavelogClient::list_stations) —
-//!   `GET /api/station_info/<key>`, used by the `stations` subcommand.
+//! See the parent module docs for the public surface. This file holds
+//! the [`WavelogClient`] implementation, the shared retry helper, the
+//! URL builders, the private serde DTOs, and the [`WavelogError`] /
+//! [`Station`] public types that the client returns.
 
 use std::fmt;
 use std::future::Future;
-use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use reqwest::Url;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
-use tokio::sync::Mutex;
 
+use super::station::Station;
 use crate::rigctld::RigState;
 
 const RETRY_SLEEPS: [Duration; 3] = [
@@ -63,19 +54,6 @@ impl fmt::Debug for Redacted<'_> {
     }
 }
 
-/// A Wavelog station-profile entry as returned by `/api/station_info`.
-/// `id` is the value to pass as `station_profile_id` when submitting
-/// QSOs to `/api/qso`. `active` reflects Wavelog's per-user
-/// `station_active` flag — exactly one profile per API-key owner is
-/// active at a time.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Station {
-    pub id: Box<str>,
-    pub name: Box<str>,
-    pub callsign: Box<str>,
-    pub active: bool,
-}
-
 #[derive(Debug, Error)]
 pub enum WavelogError {
     #[error("invalid wavelog URL `{0}`")]
@@ -93,7 +71,7 @@ pub enum WavelogError {
     Rejected { reason: Box<str> },
 
     /// `/api/station_info` returned no profile with `station_active=1`.
-    /// Not retryable in the transport sense — the operator needs to
+    /// Not retryable in the transport sense. The operator needs to
     /// pick an active station in the Wavelog UI first.
     #[error("wavelog has no active station profile for this API key")]
     NoActiveStation,
@@ -244,105 +222,6 @@ impl WavelogClient {
     }
 }
 
-/// Default TTL for [`ActiveStationCache`]. Chosen so that an operator
-/// flipping the active station in the Wavelog UI sees the daemon route
-/// QSOs to the new station within one cache window without a restart;
-/// also small enough that the daemon doesn't pin onto a stale value if
-/// they forget they changed it.
-const DEFAULT_ACTIVE_TTL: Duration = Duration::from_mins(5);
-
-/// Source of the `station_profile_id` for outbound QSO POSTs.
-///
-/// - [`StationSource::Fixed`] returns a pre-configured ID with no
-///   network traffic — used when the operator passed `--station-id`.
-/// - [`StationSource::Active`] looks the active station up via
-///   `/api/station_info` on first use and caches the result for
-///   [`DEFAULT_ACTIVE_TTL`]. Used when `--station-id` is unset.
-///
-/// `Clone` semantics differ by variant: cloning `Active` shares the
-/// underlying cache via `Arc<Mutex>`, cloning `Fixed` allocates a
-/// fresh owned ID.
-#[derive(Clone)]
-pub enum StationSource {
-    Fixed(Box<str>),
-    Active(ActiveStationCache),
-}
-
-impl StationSource {
-    /// Construct an active-lookup source using the standard 60-second
-    /// cache TTL.
-    pub fn active(client: WavelogClient) -> Self {
-        Self::Active(ActiveStationCache::new(client, DEFAULT_ACTIVE_TTL))
-    }
-
-    /// Resolve to a station ID. Returns the configured ID for
-    /// [`StationSource::Fixed`]; for [`StationSource::Active`] consults
-    /// the cache and refreshes via Wavelog on miss.
-    pub async fn resolve(&self) -> Result<Box<str>, WavelogError> {
-        match self {
-            Self::Fixed(id) => Ok(id.clone()),
-            Self::Active(cache) => cache.resolve().await,
-        }
-    }
-}
-
-impl fmt::Debug for StationSource {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Fixed(id) => write!(f, "Fixed({id:?})"),
-            Self::Active(cache) => match cache.state.try_lock() {
-                Ok(guard) => match guard.as_ref() {
-                    Some(cached) => write!(f, "Active(cached={:?})", &*cached.id),
-                    None => f.write_str("Active(unresolved)"),
-                },
-                Err(_) => f.write_str("Active(refreshing)"),
-            },
-        }
-    }
-}
-
-#[derive(Clone)]
-pub struct ActiveStationCache {
-    client: WavelogClient,
-    state: Arc<Mutex<Option<CachedActive>>>,
-    ttl: Duration,
-}
-
-#[derive(Clone)]
-struct CachedActive {
-    id: Box<str>,
-    fetched_at: Instant,
-}
-
-impl ActiveStationCache {
-    fn new(client: WavelogClient, ttl: Duration) -> Self {
-        Self {
-            client,
-            state: Arc::new(Mutex::new(None)),
-            ttl,
-        }
-    }
-
-    async fn resolve(&self) -> Result<Box<str>, WavelogError> {
-        // Hold the mutex across the fetch so only one in-flight lookup
-        // runs at a time. WSJT-X QSOs are serial through the worker,
-        // so contention here is a non-issue in practice.
-        let mut state = self.state.lock().await;
-        if let Some(cached) = state.as_ref()
-            && cached.fetched_at.elapsed() < self.ttl
-        {
-            return Ok(cached.id.clone());
-        }
-        let id = self.client.find_active_station().await?;
-        tracing::info!(station_id = %id, "resolved active wavelog station");
-        *state = Some(CachedActive {
-            id: id.clone(),
-            fetched_at: Instant::now(),
-        });
-        Ok(id)
-    }
-}
-
 /// Single retry helper shared by every POST. The closure must return
 /// a future that resolves to `Result<T, WavelogError>`; classification
 /// is delegated to [`is_retryable`].
@@ -451,6 +330,17 @@ fn is_retryable(err: &WavelogError) -> bool {
     }
 }
 
+/// Test-only constructor that bypasses the production reqwest timeout.
+/// Shared with the sibling `station` module so its tests can build a
+/// client against a `wiremock::MockServer` without rebuilding the
+/// helper. `tokio::time::pause()`-using tests require this because
+/// tokio's auto-advance would otherwise fire the timer during the real
+/// wiremock round-trip and produce a spurious `TimedOut`.
+#[cfg(test)]
+pub(super) fn client_for(server: &wiremock::MockServer) -> WavelogClient {
+    WavelogClient::with_http(&server.uri(), "test-key", reqwest::Client::new()).unwrap()
+}
+
 #[cfg(test)]
 mod tests {
     use serde_json::Value;
@@ -473,14 +363,6 @@ mod tests {
             mode: mode.into(),
             power: None,
         }
-    }
-
-    /// Build a client without the production reqwest timeout. Tests
-    /// that use `tokio::time::pause()` need this because tokio's
-    /// auto-advance would otherwise fire the timer during the real
-    /// wiremock round-trip and surface a spurious `TimedOut` error.
-    fn client_for(server: &MockServer) -> WavelogClient {
-        WavelogClient::with_http(&server.uri(), "test-key", reqwest::Client::new()).unwrap()
     }
 
     async fn radio_server_with_response(template: ResponseTemplate) -> MockServer {
@@ -882,128 +764,6 @@ mod tests {
         assert!(matches!(err, WavelogError::NoActiveStation), "got {err:?}");
         // NoActiveStation is non-retryable: reflects UI state, not transport.
         assert_eq!(server.received_requests().await.unwrap().len(), 1);
-    }
-
-    #[tokio::test]
-    async fn fixed_station_source_returns_configured_id() {
-        let src = StationSource::Fixed("42".into());
-        let resolved = src.resolve().await.unwrap();
-        assert_eq!(&*resolved, "42");
-    }
-
-    fn station_info_mock_response(active_id: &str) -> ResponseTemplate {
-        ResponseTemplate::new(200).set_body_json(serde_json::json!([
-            {
-                "station_id": "1",
-                "station_profile_name": "Home",
-                "station_callsign": "K1",
-                "station_active": null,
-            },
-            {
-                "station_id": active_id,
-                "station_profile_name": "Portable",
-                "station_callsign": "K1/P",
-                "station_active": "1",
-            }
-        ]))
-    }
-
-    #[tokio::test]
-    async fn active_station_cache_serves_cached_value_within_ttl() {
-        let server = MockServer::start().await;
-        Mock::given(method("GET"))
-            .and(path("/api/station_info/test-key"))
-            .respond_with(station_info_mock_response("7"))
-            .mount(&server)
-            .await;
-        let client = client_for(&server);
-        let cache = ActiveStationCache::new(client, Duration::from_secs(300));
-
-        let a = cache.resolve().await.unwrap();
-        let b = cache.resolve().await.unwrap();
-        assert_eq!(&*a, "7");
-        assert_eq!(&*b, "7");
-        assert_eq!(
-            server.received_requests().await.unwrap().len(),
-            1,
-            "second resolve within TTL must hit the cache, not the network",
-        );
-    }
-
-    #[tokio::test]
-    async fn active_station_cache_refreshes_after_ttl() {
-        let server = MockServer::start().await;
-        Mock::given(method("GET"))
-            .and(path("/api/station_info/test-key"))
-            .respond_with(station_info_mock_response("7"))
-            .mount(&server)
-            .await;
-        let client = client_for(&server);
-        // Very short TTL — real time, so the second resolve falls outside the window.
-        let cache = ActiveStationCache::new(client, Duration::from_millis(10));
-
-        cache.resolve().await.unwrap();
-        tokio::time::sleep(Duration::from_millis(30)).await;
-        cache.resolve().await.unwrap();
-        assert_eq!(
-            server.received_requests().await.unwrap().len(),
-            2,
-            "resolve after TTL expiry must re-fetch",
-        );
-    }
-
-    #[tokio::test]
-    async fn active_station_cache_does_not_poison_on_error() {
-        let server = MockServer::start().await;
-        // First call fails with NoActiveStation (no row is active),
-        // second call returns a populated active row.
-        Mock::given(method("GET"))
-            .and(path("/api/station_info/test-key"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
-                { "station_id": "1", "station_profile_name": "Home", "station_callsign": "K1", "station_active": null },
-            ])))
-            .up_to_n_times(1)
-            .mount(&server)
-            .await;
-        Mock::given(method("GET"))
-            .and(path("/api/station_info/test-key"))
-            .respond_with(station_info_mock_response("7"))
-            .mount(&server)
-            .await;
-        let client = client_for(&server);
-        let cache = ActiveStationCache::new(client, Duration::from_secs(300));
-
-        let first = cache.resolve().await;
-        assert!(
-            matches!(first, Err(WavelogError::NoActiveStation)),
-            "expected NoActiveStation, got {first:?}",
-        );
-        let second = cache.resolve().await.unwrap();
-        assert_eq!(
-            &*second, "7",
-            "second resolve must re-fetch (error did not poison cache)",
-        );
-    }
-
-    #[tokio::test]
-    async fn active_station_cache_is_shared_across_clones() {
-        let server = MockServer::start().await;
-        Mock::given(method("GET"))
-            .and(path("/api/station_info/test-key"))
-            .respond_with(station_info_mock_response("7"))
-            .mount(&server)
-            .await;
-        let client = client_for(&server);
-        let cache = ActiveStationCache::new(client, Duration::from_secs(300));
-        let clone = cache.clone();
-
-        cache.resolve().await.unwrap();
-        clone.resolve().await.unwrap();
-        assert_eq!(
-            server.received_requests().await.unwrap().len(),
-            1,
-            "cloned cache must share state with the original",
-        );
     }
 
     #[tokio::test]
